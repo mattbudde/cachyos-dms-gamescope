@@ -1,5 +1,11 @@
 # CachyOS DMS Gamescope
 
+> [!CAUTION]
+> This project was developed primarily with AI assistance. Always review and
+> understand the scripts before running them on your own machine, especially
+> commands that use `sudo`, modify auto-login settings, install polkit rules, or
+> restart the display manager.
+
 Live switching between a CachyOS desktop session and the native
 Gamescope/Steam session, integrated with the Dank Material Shell (DMS).
 
