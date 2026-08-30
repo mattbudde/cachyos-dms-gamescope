@@ -1,0 +1,18 @@
+{
+  "id": "cachyosGameMode",
+  "name": "CachyOS Game Mode",
+  "description": "Live switching between the DMS desktop and CachyOS Gamescope session",
+  "version": "1.1.0",
+  "author": "Matt Budde",
+  "icon": "sports_esports",
+  "type": "composite",
+  "capabilities": ["launcher", "dankbar-widget", "session-switching"],
+  "components": {
+    "launcher": "./GameModeLauncher.qml",
+    "widget": "./GameModeBar.qml"
+  },
+  "trigger": ":session",
+  "requires_dms": ">=1.5.0",
+  "dependencies": ["cachyos-sessionctl", "pkexec"],
+  "permissions": ["process"]
+}

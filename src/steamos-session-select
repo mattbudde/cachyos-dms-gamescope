@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# CachyOS Game Mode compatibility wrapper. Installed in /usr/local/bin, which
+# precedes the package-owned /usr/bin in the Gamescope systemd user PATH.
+set -euo pipefail
+
+target="${1:-}"
+
+case "$target" in
+    desktop|plasma|niri)
+        # Match CachyOS's graceful Steam shutdown before ending Game Mode.
+        steam -shutdown >/dev/null 2>&1 || true
+        exec /usr/local/bin/cachyos-sessionctl switch desktop --yes
+        ;;
+    gamescope)
+        exec /usr/local/bin/cachyos-sessionctl switch gamescope --confirm
+        ;;
+    *)
+        if [[ -x /usr/bin/steamos-session-select ]]; then
+            exec /usr/bin/steamos-session-select "$@"
+        fi
+        printf 'steamos-session-select: unsupported target %q\n' "$target" >&2
+        exit 2
+        ;;
+esac

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# CachyOS Game Mode environment scrubber. A live greetd restart can preserve the
+# previous desktop's user systemd manager briefly; Gamescope must not inherit its
+# Wayland/display socket variables or it will try to launch as a nested session.
+set -euo pipefail
+
+stale_variables=(
+    WAYLAND_DISPLAY
+    DISPLAY
+    XAUTHORITY
+    NIRI_SOCKET
+    SWAYSOCK
+    HYPRLAND_INSTANCE_SIGNATURE
+)
+
+if [[ ${CACHYOS_GAMEMODE_TESTING:-0} != 1 ]]; then
+    systemctl --user unset-environment "${stale_variables[@]}"
+    start_command=/usr/bin/start-gamescope-session
+else
+    start_command="${CACHYOS_GAMEMODE_TEST_START:?test start command is required}"
+fi
+
+unset "${stale_variables[@]}"
+exec "$start_command" "$@"

@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""Select a DMS remembered session and optionally perform a live handoff."""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import json
+import os
+import pwd
+import shutil
+import subprocess
+import sys
+import tempfile
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+
+CONFIG_PATH = Path("/etc/cachyos-gamemode.conf")
+HANDOFF_PATH = Path("/usr/libexec/cachyos-session-handoff")
+
+
+class SessionError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Config:
+    login_user: str
+    desktop_session: str
+    gamescope_session: str
+    cache_dir: Path
+
+    def session_id(self, target: str) -> str:
+        if target == "gamescope":
+            return self.gamescope_session
+        if target == "desktop":
+            return self.desktop_session
+        raise SessionError(f"unsupported target: {target}")
+
+
+def test_root() -> Path | None:
+    if os.environ.get("CACHYOS_GAMEMODE_TESTING") != "1":
+        return None
+    value = os.environ.get("CACHYOS_GAMEMODE_TEST_ROOT", "")
+    return Path(value) if value else None
+
+
+def rooted(path: Path) -> Path:
+    root = test_root()
+    if root is None:
+        return path
+    return root / path.relative_to("/")
+
+
+def config_path() -> Path:
+    return rooted(CONFIG_PATH)
+
+
+def read_config() -> Config:
+    path = config_path()
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            parser.read_file(handle)
+    except OSError as exc:
+        raise SessionError(f"cannot read {path}: {exc}") from exc
+
+    try:
+        section = parser["session"]
+        config = Config(
+            login_user=section["login_user"].strip(),
+            desktop_session=section["desktop_session"].strip(),
+            gamescope_session=section["gamescope_session"].strip(),
+            cache_dir=Path(section["dms_cache_dir"].strip()),
+        )
+    except (KeyError, ValueError) as exc:
+        raise SessionError(f"invalid session configuration in {path}: {exc}") from exc
+
+    for session_id in (config.desktop_session, config.gamescope_session):
+        if not re.fullmatch(r"[A-Za-z0-9._+-]+\.desktop", session_id):
+            raise SessionError(f"unsafe desktop session id in {path}: {session_id!r}")
+
+    if not config.login_user or not config.cache_dir.is_absolute():
+        raise SessionError(f"invalid user or cache directory in {path}")
+    return config
+
+
+def current_username() -> str:
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except KeyError as exc:
+        raise SessionError(f"cannot resolve uid {os.getuid()}") from exc
+
+
+def require_configured_user(config: Config) -> None:
+    if test_root() is not None:
+        return
+    user = current_username()
+    if user != config.login_user:
+        raise SessionError(
+            f"this integration is configured for {config.login_user!r}, not {user!r}"
+        )
+
+
+def memory_path(config: Config) -> Path:
+    return rooted(config.cache_dir) / ".local/state/memory.json"
+
+
+def read_memory(path: Path) -> tuple[dict[str, object], bytes | None]:
+    try:
+        original = path.read_bytes()
+    except FileNotFoundError:
+        return {}, None
+    except OSError as exc:
+        raise SessionError(f"cannot read DMS greeter memory {path}: {exc}") from exc
+
+    try:
+        value = json.loads(original.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SessionError(f"invalid DMS greeter memory in {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise SessionError(f"DMS greeter memory in {path} is not a JSON object")
+    return value, original
+
+
+def atomic_write(path: Path, payload: bytes) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".memory.json.", dir=path.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, 0o664)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    except OSError as exc:
+        raise SessionError(f"cannot update DMS greeter memory {path}: {exc}") from exc
+
+
+def select_target(config: Config, target: str) -> tuple[Path, bytes | None]:
+    path = memory_path(config)
+    memory, original = read_memory(path)
+    session_id = config.session_id(target)
+    memory["lastSuccessfulUser"] = config.login_user
+    memory["lastSessionId"] = f"/usr/share/wayland-sessions/{session_id}"
+    memory["lastSessionDesktopId"] = session_id
+    memory.pop("lastSessionExec", None)
+    payload = (json.dumps(memory, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    atomic_write(path, payload)
+    return path, original
+
+
+def restore_memory(path: Path, original: bytes | None) -> None:
+    if original is None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise SessionError(f"cannot roll back DMS greeter memory: {exc}") from exc
+    else:
+        atomic_write(path, original)
+
+
+def confirm_switch(target: str) -> bool:
+    destination = "Game Mode" if target == "gamescope" else "the desktop"
+    message = (
+        f"Switch to {destination} now?\n\n"
+        "This ends the current graphical session. Save open work before continuing."
+    )
+    if shutil.which("kdialog"):
+        return subprocess.run(
+            [
+                "kdialog",
+                "--title",
+                "CachyOS session handoff",
+                "--warningyesno",
+                message,
+            ],
+            check=False,
+        ).returncode == 0
+    if shutil.which("zenity"):
+        return subprocess.run(
+            ["zenity", "--question", "--title=CachyOS session handoff", f"--text={message}"],
+            check=False,
+        ).returncode == 0
+    if sys.stdin.isatty():
+        answer = input(f"{message}\nContinue? [y/N] ").strip().lower()
+        return answer in {"y", "yes"}
+    raise SessionError("confirmation requested, but no graphical dialog or terminal is available")
+
+
+def handoff_command() -> list[str]:
+    root = test_root()
+    if root is not None:
+        override = os.environ.get("CACHYOS_GAMEMODE_TEST_HANDOFF")
+        if override:
+            return [override]
+        raise SessionError("test handoff path is not configured")
+    return ["pkexec", str(HANDOFF_PATH)]
+
+
+def perform_handoff(target: str) -> None:
+    command = handoff_command() + [target]
+    try:
+        result = subprocess.run(command, check=False)
+    except OSError as exc:
+        raise SessionError(f"cannot run session handoff: {exc}") from exc
+    if result.returncode != 0:
+        raise SessionError(f"session handoff failed with status {result.returncode}")
+
+
+def current_session() -> str:
+    if os.environ.get("XDG_CURRENT_DESKTOP"):
+        return os.environ["XDG_CURRENT_DESKTOP"]
+    try:
+        active = subprocess.run(
+            ["systemctl", "--user", "is-active", "gamescope-session.target"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if active.returncode == 0:
+            return "gamescope"
+    except OSError:
+        pass
+    return "unknown"
+
+
+def status(config: Config, compact: bool) -> int:
+    path = memory_path(config)
+    memory, _ = read_memory(path)
+    selected = str(memory.get("lastSessionDesktopId", "unset"))
+    active = current_session()
+    if compact:
+        print(f"Active: {active}; next/remembered: {selected}")
+    else:
+        print(f"Configured user:   {config.login_user}")
+        print(f"Desktop session:   {config.desktop_session}")
+        print(f"Gamescope session: {config.gamescope_session}")
+        print(f"Active session:     {active}")
+        print(f"Remembered session: {selected}")
+        print(f"DMS memory:         {path}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Select or live-switch the DMS/greetd graphical session"
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    set_parser = subparsers.add_parser("set", help="select the next login session")
+    set_parser.add_argument("target", choices=("gamescope", "desktop"))
+
+    switch_parser = subparsers.add_parser("switch", help="switch sessions without rebooting")
+    switch_parser.add_argument("target", choices=("gamescope", "desktop"))
+    confirmation = switch_parser.add_mutually_exclusive_group()
+    confirmation.add_argument("--confirm", action="store_true", help="show a confirmation dialog")
+    confirmation.add_argument("--yes", action="store_true", help="skip confirmation")
+
+    status_parser = subparsers.add_parser("status", help="show active and remembered sessions")
+    status_parser.add_argument("--compact", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        config = read_config()
+        require_configured_user(config)
+
+        if args.command == "status":
+            return status(config, args.compact)
+
+        if args.command == "switch" and not args.yes:
+            if not args.confirm:
+                raise SessionError("live switching requires --confirm or --yes")
+            if not confirm_switch(args.target):
+                print("Session switch cancelled.")
+                return 0
+
+        path, original = select_target(config, args.target)
+        session_id = config.session_id(args.target)
+        if args.command == "set":
+            print(f"Remembered session set to {session_id}.")
+            return 0
+
+        try:
+            perform_handoff(args.target)
+        except SessionError:
+            restore_memory(path, original)
+            raise
+        print(f"Switching to {session_id}.")
+        return 0
+    except SessionError as exc:
+        print(f"cachyos-sessionctl: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
