@@ -102,6 +102,25 @@ cachyos-sessionctl set desktop
 - `--confirm` opens a graphical confirmation dialog when possible.
 - `--yes` skips confirmation and is intended for trusted automation.
 
+## Choosing a Game Mode monitor
+
+```bash
+cachyos-sessionctl display set gamescope DP-1    # Gamescope starts on DP-1 when connected
+cachyos-sessionctl display set gamescope auto    # back to the Gamescope package default
+cachyos-sessionctl display set desktop eDP-1     # niri focuses eDP-1 after every login
+cachyos-sessionctl display set desktop auto      # internal panel if present, else first by name
+cachyos-sessionctl status                        # shows both choices
+```
+
+The DankBar popout lists the connected monitors under **Game Mode monitor**;
+pick one before **Enter Game Mode**. The choice is stored in
+`~/.config/cachyos-gamemode/display.conf` and survives reinstalls and
+uninstalls. When Gamescope starts, the launcher shim passes the chosen
+connector as `OUTPUT_CONNECTOR=NAME,*`, so an unplugged monitor falls back to
+any connected output. When niri starts, an autostart entry runs
+`cachyos-sessionctl display restore-desktop`, which focuses the desktop
+primary; under any other desktop it exits without doing anything.
+
 ## How the handoff works
 
 1. `cachyos-sessionctl` atomically updates the DMS greeter's `memory.json` with
@@ -162,6 +181,7 @@ back to the DMS greeter instead of repeatedly launching a broken session.
 /usr/share/polkit-1/actions/org.cachyos.gamemode.policy
 /etc/cachyos-gamemode.conf
 ~/.config/DankMaterialShell/plugins/cachyosGameMode/
+~/.config/autostart/cachyos-gamemode-restore-display.desktop
 ~/.local/state/cachyos-gamemode/install-state.json
 ```
 
