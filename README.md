@@ -89,6 +89,7 @@ DankBar Layout**. You can also open the DMS launcher and type `:session`.
 
 ```bash
 cachyos-sessionctl status
+cachyos-sessionctl doctor
 cachyos-sessionctl switch gamescope --confirm
 cachyos-sessionctl switch desktop --confirm
 cachyos-sessionctl set gamescope
@@ -96,6 +97,9 @@ cachyos-sessionctl set desktop
 ```
 
 - `status` shows the active desktop and the session remembered by DMS.
+- `doctor` checks whether a live switch can work: installed files, greetd, greeter
+  memory, the plugin, and display routing. Warnings do not fail the command;
+  `--json` prints the same report for scripts.
 - `set` changes the remembered session for the next DMS login without ending
   the current session.
 - `switch` changes the remembered session and performs a live handoff.
@@ -209,19 +213,14 @@ ownership markers before removing system files.
 
 ## Troubleshooting
 
-Check the selected and active sessions:
+Check the selected and active sessions, then whether a live switch can work:
 
 ```bash
 cachyos-sessionctl status
+cachyos-sessionctl doctor
 ```
 
-Check that DMS loaded the composite plugin and instantiated its bar widget:
-
-```bash
-dms ipc call plugin-scan status cachyosGameMode
-dms ipc call widget visibility cachyosGameMode
-```
-
+`doctor` covers the files, greetd, greeter memory, plugin, and monitor choice.
 If the plugin is loaded but absent from the bar, add it in the DankBar Layout
 settings. After changing plugin files during development, `dms restart` clears
 Quickshell's external-component cache.

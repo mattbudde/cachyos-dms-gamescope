@@ -9,28 +9,48 @@ import json
 import os
 import pwd
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import re
+import xml.etree.ElementTree as ElementTree
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import NewType
+from typing import Literal, NewType
 
 
 CONFIG_PATH = Path("/etc/cachyos-gamemode.conf")
 HANDOFF_PATH = Path("/usr/libexec/cachyos-session-handoff")
+SESSIONCTL_PATH = Path("/usr/local/bin/cachyos-sessionctl")
+GAMESCOPE_SHIM_PATH = Path("/usr/local/bin/start-gamescope-session")
+STEAMOS_SELECT_PATH = Path("/usr/local/bin/steamos-session-select")
+POLKIT_PATH = Path("/usr/share/polkit-1/actions/org.cachyos.gamemode.policy")
+OS_RELEASE_PATH = Path("/etc/os-release")
 DISPLAY_PREFERENCES_RELATIVE = Path("cachyos-gamemode/display.conf")
+PLUGIN_RELATIVE = Path("DankMaterialShell/plugins/cachyosGameMode/plugin.json")
+AUTOSTART_RELATIVE = Path("autostart/cachyos-gamemode-restore-display.desktop")
+GUARD_RELATIVE = Path("inhibit-short-session-tracker")
+PLUGIN_ID = "cachyosGameMode"
+POLKIT_ACTION = "org.cachyos.gamemode.switch-session"
+AUTOSTART_EXEC_MARKER = "cachyos-sessionctl display restore-desktop"
+AUTOLOGIN_SETTINGS = (
+    "greeterAutoLogin",
+    "greeterRememberLastUser",
+    "greeterRememberLastSession",
+)
 
 Connector = NewType("Connector", str)
+CheckStatus = Literal["ok", "warn", "fail"]
 CONNECTOR_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9-]*-[0-9]+")
 INTERNAL_PANEL_PREFIXES = ("eDP-", "LVDS-", "DSI-")
 AUTO = "auto"
 DISPLAY_FIELDS = {"gamescope": "gamescope_output", "desktop": "desktop_primary"}
 NIRI_OUTPUTS_RETRY_SECONDS = 3.0
 NIRI_OUTPUTS_RETRY_INTERVAL = 0.25
+DOCTOR_COMMAND_TIMEOUT = 5.0
 
 
 class SessionError(RuntimeError):
@@ -41,6 +61,14 @@ class SessionError(RuntimeError):
 class DisplayPreferences:
     gamescope_output: Connector | None = None
     desktop_primary: Connector | None = None
+
+
+@dataclass(frozen=True)
+class Check:
+    id: str
+    status: CheckStatus
+    summary: str
+    hint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -433,6 +461,507 @@ def status(config: Config, compact: bool, as_json: bool) -> int:
     return 0
 
 
+def xdg_config_home() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME")
+    return Path(base) if base else Path.home() / ".config"
+
+
+def session_desktop_candidates(session_id: str) -> tuple[Path, ...]:
+    data_home = os.environ.get("XDG_DATA_HOME")
+    user_sessions = (
+        Path(data_home) / "wayland-sessions"
+        if data_home
+        else Path.home() / ".local/share/wayland-sessions"
+    )
+    return (
+        rooted(Path("/usr/share/wayland-sessions") / session_id),
+        rooted(Path("/usr/local/share/wayland-sessions") / session_id),
+        user_sessions / session_id,
+    )
+
+
+def find_session_desktop(session_id: str) -> Path | None:
+    for path in session_desktop_candidates(session_id):
+        if path.is_file():
+            return path
+    return None
+
+
+def run_text(command: list[str]) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=DOCTOR_COMMAND_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def try_read_config() -> tuple[Config | None, str | None]:
+    try:
+        config = read_config()
+    except SessionError as exc:
+        return None, str(exc)
+    if test_root() is None:
+        try:
+            require_configured_user(config)
+        except SessionError as exc:
+            return config, str(exc)
+    return config, None
+
+
+def file_contains(path: Path, marker: str) -> bool:
+    try:
+        return marker in path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+
+def check_marked_file(
+    check_id: str,
+    path: Path,
+    marker: str,
+    *,
+    executable: bool,
+) -> Check:
+    live = rooted(path)
+    if not live.is_file():
+        return Check(check_id, "fail", f"{path} is missing")
+    if executable and not os.access(live, os.X_OK):
+        return Check(check_id, "fail", f"{path} is not executable")
+    if not file_contains(live, marker):
+        return Check(
+            check_id,
+            "fail",
+            f"{path} is not the CachyOS Game Mode file",
+            "re-run install.sh so it can replace an unrecognized file",
+        )
+    return Check(check_id, "ok", str(path))
+
+
+def check_config(config: Config | None, error: str | None) -> Check:
+    if error is not None:
+        hint = None
+        if config is not None:
+            hint = f"run as {config.login_user}, not {current_username()}"
+        return Check("config", "fail", error, hint)
+    assert config is not None
+    return Check(
+        "config",
+        "ok",
+        f"{config_path()} ({config.login_user}, {config.desktop_session})",
+    )
+
+
+def check_config_perms() -> Check:
+    path = config_path()
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        return Check("config-perms", "fail", f"cannot inspect {path}: {exc}")
+    if not stat.S_ISREG(info.st_mode):
+        return Check("config-perms", "fail", f"{path} is not a regular file")
+    if info.st_mode & 0o022:
+        return Check(
+            "config-perms",
+            "fail",
+            f"{path} must not be group/world-writable",
+            "reinstall so install.sh can write a root-owned 0644 config",
+        )
+    if test_root() is None and info.st_uid != 0:
+        return Check(
+            "config-perms",
+            "fail",
+            f"{path} must be root-owned",
+            "reinstall so install.sh can write a root-owned 0644 config",
+        )
+    return Check("config-perms", "ok", f"{path} is a regular, non-writable-by-others file")
+
+
+def check_session_desktops(config: Config | None) -> Check:
+    if config is None:
+        return Check("session-desktops", "fail", "no session configuration to check")
+    missing = [
+        session_id
+        for session_id in (config.desktop_session, config.gamescope_session)
+        if find_session_desktop(session_id) is None
+    ]
+    if missing:
+        return Check(
+            "session-desktops",
+            "fail",
+            "missing " + ", ".join(missing),
+            "install gamescope-session-cachyos and the configured desktop session",
+        )
+    return Check(
+        "session-desktops",
+        "ok",
+        f"{config.desktop_session} and {config.gamescope_session} are installed",
+    )
+
+
+def check_shim() -> Check:
+    marked = check_marked_file(
+        "bin-shim",
+        GAMESCOPE_SHIM_PATH,
+        "CachyOS Game Mode environment scrubber",
+        executable=True,
+    )
+    if marked.status != "ok":
+        return marked
+    expected = rooted(GAMESCOPE_SHIM_PATH).resolve()
+    resolved = shutil.which("start-gamescope-session")
+    if resolved is None:
+        return Check(
+            "bin-shim",
+            "fail",
+            "start-gamescope-session is not on PATH",
+            "ensure /usr/local/bin is on PATH",
+        )
+    if Path(resolved).resolve() != expected:
+        return Check(
+            "bin-shim",
+            "fail",
+            f"start-gamescope-session resolves to {resolved}, not {expected}",
+            "ensure /usr/local/bin precedes /usr/bin in PATH",
+        )
+    return Check("bin-shim", "ok", str(GAMESCOPE_SHIM_PATH))
+
+
+def check_polkit() -> Check:
+    path = rooted(POLKIT_PATH)
+    if not path.is_file():
+        return Check("polkit", "fail", f"{POLKIT_PATH} is missing")
+    try:
+        root = ElementTree.parse(path).getroot()
+    except ElementTree.ParseError as exc:
+        return Check("polkit", "fail", f"{POLKIT_PATH} is not valid XML: {exc}")
+    action = root.find("action")
+    if action is None or action.attrib.get("id") != POLKIT_ACTION:
+        return Check(
+            "polkit",
+            "fail",
+            f"{POLKIT_PATH} is missing {POLKIT_ACTION}",
+        )
+    annotate = action.find("annotate")
+    exec_path = (annotate.text or "").strip() if annotate is not None else ""
+    if exec_path != str(HANDOFF_PATH):
+        return Check(
+            "polkit",
+            "fail",
+            f"polkit exec.path is {exec_path!r}, expected {str(HANDOFF_PATH)!r}",
+        )
+    return Check("polkit", "ok", f"{POLKIT_PATH} allows the handoff helper")
+
+
+def check_pkexec() -> Check:
+    resolved = shutil.which("pkexec")
+    if resolved is None:
+        return Check("pkexec", "fail", "pkexec is not on PATH")
+    return Check("pkexec", "ok", resolved)
+
+
+def check_display_manager() -> Check | None:
+    if test_root() is not None:
+        return None
+    result = run_text(["systemctl", "show", "-p", "Id", "--value", "display-manager"])
+    if result is None:
+        return Check("display-manager", "fail", "cannot query display-manager.service")
+    identity = result.stdout.strip()
+    if identity != "greetd.service":
+        return Check(
+            "display-manager",
+            "fail",
+            f"display-manager is {identity or 'unset'}, expected greetd.service",
+        )
+    active = run_text(["systemctl", "is-active", "--quiet", "greetd.service"])
+    if active is None or active.returncode != 0:
+        return Check("display-manager", "fail", "greetd.service is not active")
+    return Check("display-manager", "ok", "greetd.service is the active display manager")
+
+
+def check_memory(config: Config | None) -> Check:
+    cache = config.cache_dir if config is not None else Path("/var/cache/dms-greeter")
+    state_dir = rooted(cache) / ".local/state"
+    path = state_dir / "memory.json"
+    hint = "verify that this user belongs to the greeter group"
+    if not state_dir.is_dir():
+        return Check(
+            "memory",
+            "fail",
+            f"{state_dir} is missing",
+            hint,
+        )
+    if not os.access(state_dir, os.W_OK):
+        return Check("memory", "fail", f"{state_dir} is not writable", hint)
+    if not path.exists():
+        return Check("memory", "ok", f"{path} is absent; the next set will create it")
+    try:
+        memory, _ = read_memory(path)
+    except SessionError as exc:
+        return Check("memory", "fail", str(exc))
+    selected = memory.get("lastSessionDesktopId", "unset")
+    return Check("memory", "ok", f"{path} (remembered {selected})")
+
+
+def check_autologin() -> Check | None:
+    if test_root() is not None:
+        return None
+    missing: list[str] = []
+    queried = 0
+    for setting in AUTOLOGIN_SETTINGS:
+        result = run_text(["dms", "ipc", "call", "settings", "get", setting])
+        if result is None or result.returncode != 0:
+            continue
+        queried += 1
+        if result.stdout.strip() != "true":
+            missing.append(setting)
+    if queried == 0:
+        return Check(
+            "autologin",
+            "warn",
+            "could not query DMS greeter settings",
+            "start a DMS session and re-run doctor",
+        )
+    if missing:
+        return Check(
+            "autologin",
+            "fail",
+            "disabled: " + ", ".join(missing),
+            "re-run install.sh without --no-autologin",
+        )
+    return Check("autologin", "ok", "DMS greeter auto-login and remember-session are enabled")
+
+
+def check_plugin_files() -> Check:
+    path = xdg_config_home() / PLUGIN_RELATIVE
+    if not path.is_file():
+        return Check(
+            "plugin-files",
+            "fail",
+            f"{path} is missing",
+            "re-run install.sh without --no-plugin",
+        )
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return Check("plugin-files", "fail", f"{path} is not valid JSON: {exc}")
+    if not isinstance(manifest, dict) or manifest.get("id") != PLUGIN_ID:
+        return Check("plugin-files", "fail", f"{path} is not the {PLUGIN_ID} plugin")
+    return Check("plugin-files", "ok", str(path))
+
+
+def check_plugin_enabled() -> Check | None:
+    if test_root() is not None:
+        return None
+    result = run_text(["dms", "ipc", "call", "plugin-scan", "status", PLUGIN_ID])
+    if result is None or result.returncode != 0:
+        return Check(
+            "plugin-enabled",
+            "warn",
+            "could not query DMS plugin status",
+            "start a DMS session and re-run doctor",
+        )
+    status = result.stdout.split("\t", 1)[0].strip()
+    if status != "loaded":
+        return Check(
+            "plugin-enabled",
+            "warn",
+            f"plugin status is {status or 'unknown'}",
+            "enable cachyosGameMode in DMS plugins",
+        )
+    return Check("plugin-enabled", "ok", "cachyosGameMode is loaded")
+
+
+def check_plugin_widget() -> Check | None:
+    if test_root() is not None:
+        return None
+    result = run_text(["dms", "ipc", "call", "widget", "visibility", PLUGIN_ID])
+    if result is None or result.returncode != 0:
+        return Check(
+            "plugin-widget",
+            "warn",
+            "could not query DankBar widget visibility",
+            "add CachyOS Game Mode in Settings → Appearance → DankBar Layout",
+        )
+    visibility = result.stdout.strip()
+    if visibility != "visible":
+        return Check(
+            "plugin-widget",
+            "warn",
+            f"widget visibility is {visibility or 'unknown'}",
+            "add CachyOS Game Mode in Settings → Appearance → DankBar Layout",
+        )
+    return Check("plugin-widget", "ok", "DankBar widget is visible")
+
+
+def check_autostart() -> Check:
+    path = xdg_config_home() / AUTOSTART_RELATIVE
+    if not niri_session_active():
+        return Check("autostart", "ok", "not a niri session; restore autostart is unused")
+    if not path.is_file():
+        return Check(
+            "autostart",
+            "warn",
+            f"{path} is missing",
+            "re-run install.sh to restore the niri display autostart entry",
+        )
+    if not file_contains(path, AUTOSTART_EXEC_MARKER):
+        return Check(
+            "autostart",
+            "warn",
+            f"{path} is not the Game Mode restore entry",
+        )
+    return Check("autostart", "ok", str(path))
+
+
+def check_gamescope_output() -> Check:
+    path = display_preferences_path()
+    try:
+        preferences = read_display_preferences(path)
+    except SessionError as exc:
+        return Check("gamescope-output", "fail", str(exc))
+    if preferences.gamescope_output is None:
+        return Check("gamescope-output", "ok", "auto")
+    connector = preferences.gamescope_output
+    if not niri_session_active():
+        return Check(
+            "gamescope-output",
+            "warn",
+            f"{connector} is pinned; cannot verify it outside niri",
+        )
+    try:
+        outputs = niri_outputs()
+    except SessionError as exc:
+        return Check("gamescope-output", "warn", f"cannot query niri outputs: {exc}")
+    if connector in outputs:
+        return Check("gamescope-output", "ok", f"{connector} is connected")
+    return Check(
+        "gamescope-output",
+        "warn",
+        f"{connector} is not connected; Gamescope will fall back to any output",
+        f"cachyos-sessionctl display set gamescope {AUTO}",
+    )
+
+
+def check_short_session() -> Check:
+    path = xdg_config_home() / GUARD_RELATIVE
+    if path.exists():
+        return Check(
+            "short-session",
+            "warn",
+            f"{path} is present",
+            f"rm {path} after a few clean Game Mode round trips",
+        )
+    return Check("short-session", "ok", "short-session repair guard is not present")
+
+
+def check_os() -> Check:
+    path = rooted(OS_RELEASE_PATH)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return Check("os", "warn", f"{OS_RELEASE_PATH} is missing")
+    identity = ""
+    for line in text.splitlines():
+        if line.startswith("ID="):
+            identity = line.partition("=")[2].strip().strip("\"'")
+            break
+    if identity != "cachyos":
+        return Check("os", "warn", f"OS ID is {identity or 'unset'}, expected cachyos")
+    return Check("os", "ok", "CachyOS")
+
+
+def collect_doctor_checks() -> list[Check]:
+    config, config_error = try_read_config()
+    checks: list[Check] = [
+        check_config(config, config_error),
+        check_config_perms(),
+        check_session_desktops(config),
+        check_marked_file(
+            "bin-sessionctl",
+            SESSIONCTL_PATH,
+            "cachyos-sessionctl:",
+            executable=True,
+        ),
+        check_marked_file(
+            "bin-handoff",
+            HANDOFF_PATH,
+            "cachyos-session-handoff:",
+            executable=True,
+        ),
+        check_shim(),
+        check_marked_file(
+            "bin-steamos",
+            STEAMOS_SELECT_PATH,
+            "CachyOS Game Mode compatibility wrapper",
+            executable=True,
+        ),
+        check_polkit(),
+        check_pkexec(),
+    ]
+    for probe in (
+        check_display_manager,
+        lambda: check_memory(config),
+        check_autologin,
+        check_plugin_files,
+        check_plugin_enabled,
+        check_plugin_widget,
+        check_autostart,
+        check_gamescope_output,
+        check_short_session,
+        check_os,
+    ):
+        result = probe()
+        if result is not None:
+            checks.append(result)
+    return checks
+
+
+def doctor_report(checks: list[Check]) -> dict[str, object]:
+    fail = sum(1 for check in checks if check.status == "fail")
+    warn = sum(1 for check in checks if check.status == "warn")
+    return {
+        "ok": fail == 0,
+        "fail": fail,
+        "warn": warn,
+        "checks": [
+            {
+                "hint": check.hint,
+                "id": check.id,
+                "status": check.status,
+                "summary": check.summary,
+            }
+            for check in checks
+        ],
+    }
+
+
+def print_doctor_report(checks: list[Check]) -> None:
+    width = max((len(check.id) for check in checks), default=0)
+    for check in checks:
+        print(f"{check.status:<5} {check.id:<{width}}  {check.summary}")
+        if check.hint and check.status != "ok":
+            print(f"      {'':<{width}}  {check.hint}")
+    ok = sum(1 for check in checks if check.status == "ok")
+    warn = sum(1 for check in checks if check.status == "warn")
+    fail = sum(1 for check in checks if check.status == "fail")
+    print()
+    print(f"{ok} ok, {warn} warn, {fail} fail")
+
+
+def doctor_command(as_json: bool) -> int:
+    checks = collect_doctor_checks()
+    if as_json:
+        print(json.dumps(doctor_report(checks), indent=2, sort_keys=True))
+    else:
+        print_doctor_report(checks)
+    return 1 if any(check.status == "fail" for check in checks) else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Select or live-switch the DMS/greetd graphical session"
@@ -452,6 +981,13 @@ def build_parser() -> argparse.ArgumentParser:
     status_format = status_parser.add_mutually_exclusive_group()
     status_format.add_argument("--compact", action="store_true")
     status_format.add_argument("--json", action="store_true", help="machine-readable report")
+
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="check whether a live session switch can work"
+    )
+    doctor_parser.add_argument(
+        "--json", action="store_true", help="machine-readable report"
+    )
 
     display_parser = subparsers.add_parser("display", help="choose monitors per session")
     display_commands = display_parser.add_subparsers(dest="display_command", required=True)
@@ -474,6 +1010,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "display":
             return display_command(args)
+        if args.command == "doctor":
+            return doctor_command(args.json)
 
         config = read_config()
         require_configured_user(config)

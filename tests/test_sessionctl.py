@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -48,6 +49,7 @@ class IntegrationTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        self.config.chmod(0o644)
         self.original = {
             "lastSuccessfulUser": "test-user",
             "lastSessionDesktopId": "niri.desktop",
@@ -344,6 +346,182 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Gamescope output:   auto", result.stdout)
         self.assertIn("Desktop primary:    eDP-1", result.stdout)
+
+    def plant_install(self) -> None:
+        bindir = self.root / "usr/local/bin"
+        libexec = self.root / "usr/libexec"
+        polkit = self.root / "usr/share/polkit-1/actions"
+        sessions = self.root / "usr/share/wayland-sessions"
+        plugin = self.config_home / "DankMaterialShell/plugins/cachyosGameMode"
+        autostart = self.config_home / "autostart"
+        for directory in (bindir, libexec, polkit, sessions, plugin, autostart):
+            directory.mkdir(parents=True, exist_ok=True)
+        copies = {
+            PROJECT / "src/cachyos-sessionctl": bindir / "cachyos-sessionctl",
+            PROJECT / "src/cachyos-session-handoff": libexec / "cachyos-session-handoff",
+            PROJECT / "src/start-gamescope-session": bindir / "start-gamescope-session",
+            PROJECT / "src/steamos-session-select": bindir / "steamos-session-select",
+            PROJECT / "polkit/org.cachyos.gamemode.policy": polkit
+            / "org.cachyos.gamemode.policy",
+            PROJECT / "dms-plugin/cachyosGameMode/plugin.json": plugin / "plugin.json",
+            PROJECT
+            / "autostart/cachyos-gamemode-restore-display.desktop": autostart
+            / "cachyos-gamemode-restore-display.desktop",
+        }
+        for source, destination in copies.items():
+            shutil.copy(source, destination)
+        for executable in (
+            bindir / "cachyos-sessionctl",
+            bindir / "start-gamescope-session",
+            bindir / "steamos-session-select",
+            libexec / "cachyos-session-handoff",
+        ):
+            executable.chmod(0o755)
+        (sessions / "niri.desktop").write_text("[Desktop Entry]\nName=niri\n")
+        (sessions / "gamescope-session.desktop").write_text(
+            "[Desktop Entry]\nName=Gamescope\n"
+        )
+        (self.root / "etc/os-release").write_text("ID=cachyos\n", encoding="utf-8")
+
+    def doctor_environment(
+        self, *path_prefix: Path, desktop: str = "niri"
+    ) -> dict[str, str]:
+        prefixes = path_prefix or (self.root / "usr/local/bin",)
+        return self.environment | {
+            "PATH": ":".join((*(str(path) for path in prefixes), self.environment["PATH"])),
+            "XDG_CURRENT_DESKTOP": desktop,
+        }
+
+    def run_doctor(
+        self, *arguments: str, environment: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        return self.run_sessionctl(
+            "doctor", *arguments, environment=environment or self.doctor_environment()
+        )
+
+    @staticmethod
+    def doctor_by_id(result: subprocess.CompletedProcess[str]) -> dict[str, dict]:
+        report = json.loads(result.stdout)
+        return {item["id"]: item for item in report["checks"]}
+
+    def test_doctor_reports_failures_without_install(self) -> None:
+        result = self.run_doctor("--json")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertFalse(report["ok"])
+        self.assertGreater(report["fail"], 0)
+        checks = self.doctor_by_id(result)
+        self.assertEqual(checks["config"]["status"], "ok")
+        self.assertEqual(checks["memory"]["status"], "ok")
+        for check_id in (
+            "session-desktops",
+            "bin-sessionctl",
+            "bin-handoff",
+            "bin-shim",
+            "bin-steamos",
+            "polkit",
+            "plugin-files",
+        ):
+            self.assertEqual(checks[check_id]["status"], "fail", check_id)
+        self.assertEqual(checks["autostart"]["status"], "warn")
+        self.assertEqual(checks["os"]["status"], "warn")
+        self.assertNotIn("display-manager", checks)
+        self.assertNotIn("autologin", checks)
+
+    def test_doctor_passes_a_planted_install(self) -> None:
+        self.plant_install()
+        result = self.run_doctor("--json")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["fail"], 0)
+        checks = self.doctor_by_id(result)
+        for check_id in (
+            "config",
+            "config-perms",
+            "session-desktops",
+            "bin-sessionctl",
+            "bin-handoff",
+            "bin-shim",
+            "bin-steamos",
+            "polkit",
+            "memory",
+            "plugin-files",
+            "autostart",
+            "gamescope-output",
+            "short-session",
+            "os",
+        ):
+            self.assertEqual(checks[check_id]["status"], "ok", checks[check_id])
+        self.assertNotIn("display-manager", checks)
+        self.assertNotIn("plugin-enabled", checks)
+        self.assertNotIn("plugin-widget", checks)
+
+    def test_doctor_fails_when_config_is_missing(self) -> None:
+        self.config.unlink()
+        result = self.run_doctor("--json")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.doctor_by_id(result)["config"]["status"], "fail")
+
+    def test_doctor_rejects_world_writable_config(self) -> None:
+        self.plant_install()
+        self.config.chmod(0o666)
+        result = self.run_doctor("--json")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.doctor_by_id(result)["config-perms"]["status"], "fail")
+
+    def test_doctor_fails_when_shim_is_shadowed_on_path(self) -> None:
+        self.plant_install()
+        shadowed = self.root / "usr/bin"
+        shadowed.mkdir(parents=True)
+        shutil.copy(
+            self.root / "usr/local/bin/start-gamescope-session",
+            shadowed / "start-gamescope-session",
+        )
+        (shadowed / "start-gamescope-session").chmod(0o755)
+        result = self.run_doctor(
+            "--json",
+            environment=self.doctor_environment(
+                shadowed, self.root / "usr/local/bin"
+            ),
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.doctor_by_id(result)["bin-shim"]["status"], "fail")
+
+    def test_doctor_warns_about_the_short_session_guard(self) -> None:
+        self.plant_install()
+        guard = self.config_home / "inhibit-short-session-tracker"
+        guard.write_text("", encoding="utf-8")
+        result = self.run_doctor("--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        check = self.doctor_by_id(result)["short-session"]
+        self.assertEqual(check["status"], "warn")
+        self.assertIn(str(guard), check["hint"])
+
+    def test_doctor_warns_when_gamescope_output_is_unplugged(self) -> None:
+        self.plant_install()
+        self.run_sessionctl("display", "set", "gamescope", "HDMI-A-1")
+        self.make_fake_niri(self.enabled("eDP-1"))
+        result = self.run_doctor(
+            "--json",
+            environment=self.doctor_environment(
+                self.root / "fake-bin", self.root / "usr/local/bin"
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.doctor_by_id(result)["gamescope-output"]["status"], "warn")
+
+    def test_doctor_ignores_missing_autostart_outside_niri(self) -> None:
+        self.plant_install()
+        autostart = (
+            self.config_home / "autostart/cachyos-gamemode-restore-display.desktop"
+        )
+        autostart.unlink()
+        result = self.run_doctor(
+            "--json", environment=self.doctor_environment(desktop="KDE")
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.doctor_by_id(result)["autostart"]["status"], "ok")
 
     @unittest.skipIf(os.geteuid() == 0, "root helper test mode is intentionally disabled")
     def test_privileged_helper_rearms_runfile_in_test_mode(self) -> None:
