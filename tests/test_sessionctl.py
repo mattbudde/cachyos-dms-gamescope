@@ -370,10 +370,13 @@ exit 0
         }
         for source, destination in copies.items():
             shutil.copy(source, destination)
+        pkexec = bindir / "pkexec"
+        pkexec.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
         for executable in (
             bindir / "cachyos-sessionctl",
             bindir / "start-gamescope-session",
             bindir / "steamos-session-select",
+            bindir / "pkexec",
             libexec / "cachyos-session-handoff",
         ):
             executable.chmod(0o755)
@@ -445,6 +448,7 @@ exit 0
             "bin-shim",
             "bin-steamos",
             "polkit",
+            "pkexec",
             "memory",
             "plugin-files",
             "autostart",
