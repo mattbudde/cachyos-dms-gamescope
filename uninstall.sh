@@ -38,6 +38,7 @@ state_dir="$user_home/.local/state/cachyos-gamemode"
 state_file="$state_dir/install-state.json"
 plugin_dir="$user_home/.config/DankMaterialShell/plugins/cachyosGameMode"
 guard_file="$user_home/.config/inhibit-short-session-tracker"
+autostart_file="$user_home/.config/autostart/cachyos-gamemode-restore-display.desktop"
 
 show_command() {
     printf '  +'
@@ -116,6 +117,13 @@ done
 
 if [[ $guard_was_present == false ]]; then
     run rm -f -- "$guard_file"
+fi
+if [[ -e $autostart_file ]]; then
+    if grep -Fq -- 'cachyos-sessionctl display restore-desktop' "$autostart_file"; then
+        run rm -f -- "$autostart_file"
+    else
+        printf 'Leaving unrecognized autostart entry in place: %s\n' "$autostart_file" >&2
+    fi
 fi
 
 if [[ $greeter_settings_changed == true ]]; then

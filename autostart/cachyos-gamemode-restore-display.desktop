@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=CachyOS Game Mode display restore
+Comment=Focus the desktop primary monitor when niri starts
+Exec=/usr/local/bin/cachyos-sessionctl display restore-desktop
+OnlyShowIn=niri;
+NoDisplay=true

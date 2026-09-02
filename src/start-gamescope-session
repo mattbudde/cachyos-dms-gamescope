@@ -11,14 +11,27 @@ stale_variables=(
     NIRI_SOCKET
     SWAYSOCK
     HYPRLAND_INSTANCE_SIGNATURE
+    OUTPUT_CONNECTOR
 )
+
+sessionctl="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/cachyos-sessionctl"
+if ! prefer_output="$("$sessionctl" display prefer-output)"; then
+    printf '%s\n' 'start-gamescope-session: display preference unavailable; using Gamescope defaults' >&2
+    prefer_output=""
+fi
 
 if [[ ${CACHYOS_GAMEMODE_TESTING:-0} != 1 ]]; then
     systemctl --user unset-environment "${stale_variables[@]}"
+    if [[ -n $prefer_output ]]; then
+        systemctl --user set-environment "OUTPUT_CONNECTOR=$prefer_output"
+    fi
     start_command=/usr/bin/start-gamescope-session
 else
     start_command="${CACHYOS_GAMEMODE_TEST_START:?test start command is required}"
 fi
 
 unset "${stale_variables[@]}"
+if [[ -n $prefer_output ]]; then
+    export OUTPUT_CONNECTOR="$prefer_output"
+fi
 exec "$start_command" "$@"

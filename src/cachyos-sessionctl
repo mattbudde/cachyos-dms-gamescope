@@ -12,17 +12,35 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import re
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import NewType
 
 
 CONFIG_PATH = Path("/etc/cachyos-gamemode.conf")
 HANDOFF_PATH = Path("/usr/libexec/cachyos-session-handoff")
+DISPLAY_PREFERENCES_RELATIVE = Path("cachyos-gamemode/display.conf")
+
+Connector = NewType("Connector", str)
+CONNECTOR_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9-]*-[0-9]+")
+INTERNAL_PANEL_PREFIXES = ("eDP-", "LVDS-", "DSI-")
+AUTO = "auto"
+DISPLAY_FIELDS = {"gamescope": "gamescope_output", "desktop": "desktop_primary"}
+NIRI_OUTPUTS_RETRY_SECONDS = 3.0
+NIRI_OUTPUTS_RETRY_INTERVAL = 0.25
 
 
 class SessionError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class DisplayPreferences:
+    gamescope_output: Connector | None = None
+    desktop_primary: Connector | None = None
 
 
 @dataclass(frozen=True)
@@ -129,7 +147,7 @@ def atomic_write(path: Path, payload: bytes) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
-            prefix=".memory.json.", dir=path.parent
+            prefix=f".{path.name}.", dir=path.parent
         )
         temporary = Path(temporary_name)
         try:
@@ -142,7 +160,7 @@ def atomic_write(path: Path, payload: bytes) -> None:
         finally:
             temporary.unlink(missing_ok=True)
     except OSError as exc:
-        raise SessionError(f"cannot update DMS greeter memory {path}: {exc}") from exc
+        raise SessionError(f"cannot write {path}: {exc}") from exc
 
 
 def select_target(config: Config, target: str) -> tuple[Path, bytes | None]:
@@ -166,6 +184,152 @@ def restore_memory(path: Path, original: bytes | None) -> None:
             raise SessionError(f"cannot roll back DMS greeter memory: {exc}") from exc
     else:
         atomic_write(path, original)
+
+
+def parse_connector(text: str) -> Connector:
+    if not CONNECTOR_PATTERN.fullmatch(text):
+        raise SessionError(f"not a DRM connector name: {text!r}")
+    return Connector(text)
+
+
+def parse_connector_or_auto(text: str) -> Connector | None:
+    return None if text == AUTO else parse_connector(text)
+
+
+def display_preferences_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    return Path(base) / DISPLAY_PREFERENCES_RELATIVE
+
+
+def read_display_preferences(path: Path) -> DisplayPreferences:
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            parser.read_file(handle)
+    except FileNotFoundError:
+        return DisplayPreferences()
+    except (OSError, configparser.Error) as exc:
+        raise SessionError(f"cannot read display preferences {path}: {exc}") from exc
+
+    section = parser["display"] if parser.has_section("display") else {}
+    values = {
+        field: parse_connector(section[field].strip())
+        for field in DISPLAY_FIELDS.values()
+        if field in section
+    }
+    return DisplayPreferences(**values)
+
+
+def write_display_preferences(path: Path, preferences: DisplayPreferences) -> None:
+    lines = ["[display]"]
+    for field in DISPLAY_FIELDS.values():
+        value = getattr(preferences, field)
+        if value is not None:
+            lines.append(f"{field} = {value}")
+    atomic_write(path, ("\n".join(lines) + "\n").encode("utf-8"))
+
+
+def gamescope_prefer_output(preferences: DisplayPreferences) -> str | None:
+    if preferences.gamescope_output is None:
+        return None
+    return f"{preferences.gamescope_output},*"
+
+
+def default_primary(outputs: Sequence[Connector]) -> Connector | None:
+    ordered = sorted(outputs)
+    for output in ordered:
+        if output.startswith(INTERNAL_PANEL_PREFIXES):
+            return output
+    return ordered[0] if ordered else None
+
+
+def resolve_desktop_primary(
+    preferences: DisplayPreferences, outputs: Sequence[Connector]
+) -> Connector | None:
+    if preferences.desktop_primary in outputs:
+        return preferences.desktop_primary
+    return default_primary(outputs)
+
+
+def niri_session_active() -> bool:
+    desktops = os.environ.get("XDG_CURRENT_DESKTOP", "").lower().split(":")
+    return "niri" in desktops
+
+
+def niri_outputs() -> tuple[Connector, ...]:
+    try:
+        result = subprocess.run(
+            ["niri", "msg", "--json", "outputs"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise SessionError(f"cannot query niri outputs: {exc}") from exc
+    if result.returncode != 0:
+        raise SessionError(f"niri msg outputs failed: {result.stderr.strip()}")
+    try:
+        reply = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise SessionError(f"invalid niri outputs reply: {exc}") from exc
+    if not isinstance(reply, dict):
+        raise SessionError("niri outputs reply is not a JSON object")
+    return tuple(
+        parse_connector(name)
+        for name, output in reply.items()
+        if isinstance(output, dict) and output.get("logical") is not None
+    )
+
+
+def niri_focus_monitor(connector: Connector) -> None:
+    try:
+        result = subprocess.run(
+            ["niri", "msg", "action", "focus-monitor", connector], check=False
+        )
+    except OSError as exc:
+        raise SessionError(f"cannot focus niri monitor: {exc}") from exc
+    if result.returncode != 0:
+        raise SessionError(f"niri focus-monitor {connector} failed with status {result.returncode}")
+
+
+def restore_desktop_display(preferences: DisplayPreferences) -> int:
+    if not niri_session_active():
+        print("Not a niri session; nothing to restore.")
+        return 0
+    deadline = time.monotonic() + NIRI_OUTPUTS_RETRY_SECONDS
+    outputs = niri_outputs()
+    while not outputs and time.monotonic() < deadline:
+        time.sleep(NIRI_OUTPUTS_RETRY_INTERVAL)
+        outputs = niri_outputs()
+    primary = resolve_desktop_primary(preferences, outputs)
+    if primary is None:
+        raise SessionError("niri reported no enabled outputs")
+    niri_focus_monitor(primary)
+    print(f"Focused {primary}.")
+    return 0
+
+
+def display_set(target: str, value: str) -> int:
+    connector = parse_connector_or_auto(value)
+    path = display_preferences_path()
+    preferences = replace(
+        read_display_preferences(path), **{DISPLAY_FIELDS[target]: connector}
+    )
+    write_display_preferences(path, preferences)
+    print(f"Display preference for {target} set to {value}.")
+    return 0
+
+
+def display_command(args: argparse.Namespace) -> int:
+    if args.display_command == "set":
+        return display_set(args.target, args.connector)
+    preferences = read_display_preferences(display_preferences_path())
+    if args.display_command == "prefer-output":
+        prefer_output = gamescope_prefer_output(preferences)
+        if prefer_output is not None:
+            print(prefer_output)
+        return 0
+    return restore_desktop_display(preferences)
 
 
 def confirm_switch(target: str) -> bool:
@@ -233,20 +397,39 @@ def current_session() -> str:
     return "unknown"
 
 
-def status(config: Config, compact: bool) -> int:
+def status(config: Config, compact: bool, as_json: bool) -> int:
     path = memory_path(config)
     memory, _ = read_memory(path)
     selected = str(memory.get("lastSessionDesktopId", "unset"))
     active = current_session()
     if compact:
         print(f"Active: {active}; next/remembered: {selected}")
-    else:
-        print(f"Configured user:   {config.login_user}")
-        print(f"Desktop session:   {config.desktop_session}")
-        print(f"Gamescope session: {config.gamescope_session}")
-        print(f"Active session:     {active}")
-        print(f"Remembered session: {selected}")
-        print(f"DMS memory:         {path}")
+        return 0
+
+    preferences = read_display_preferences(display_preferences_path())
+    prefer_output = gamescope_prefer_output(preferences)
+    if as_json:
+        report = {
+            "active": active,
+            "remembered": selected,
+            "display": {
+                "gamescope_output": preferences.gamescope_output,
+                "gamescope_prefer_output": prefer_output,
+                "desktop_primary": preferences.desktop_primary,
+            },
+        }
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+
+    print(f"Configured user:   {config.login_user}")
+    print(f"Desktop session:   {config.desktop_session}")
+    print(f"Gamescope session: {config.gamescope_session}")
+    print(f"Active session:     {active}")
+    print(f"Remembered session: {selected}")
+    print(f"DMS memory:         {path}")
+    print(f"Gamescope output:   {preferences.gamescope_output or AUTO}"
+          + (f" (OUTPUT_CONNECTOR={prefer_output})" if prefer_output else ""))
+    print(f"Desktop primary:    {preferences.desktop_primary or AUTO}")
     return 0
 
 
@@ -266,18 +449,37 @@ def build_parser() -> argparse.ArgumentParser:
     confirmation.add_argument("--yes", action="store_true", help="skip confirmation")
 
     status_parser = subparsers.add_parser("status", help="show active and remembered sessions")
-    status_parser.add_argument("--compact", action="store_true")
+    status_format = status_parser.add_mutually_exclusive_group()
+    status_format.add_argument("--compact", action="store_true")
+    status_format.add_argument("--json", action="store_true", help="machine-readable report")
+
+    display_parser = subparsers.add_parser("display", help="choose monitors per session")
+    display_commands = display_parser.add_subparsers(dest="display_command", required=True)
+    display_set_parser = display_commands.add_parser(
+        "set", help="pick the Gamescope monitor or the desktop primary"
+    )
+    display_set_parser.add_argument("target", choices=tuple(DISPLAY_FIELDS))
+    display_set_parser.add_argument("connector", metavar="CONNECTOR|auto")
+    display_commands.add_parser(
+        "prefer-output", help="print the Gamescope OUTPUT_CONNECTOR value, if any"
+    )
+    display_commands.add_parser(
+        "restore-desktop", help="focus the desktop primary monitor under niri"
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "display":
+            return display_command(args)
+
         config = read_config()
         require_configured_user(config)
 
         if args.command == "status":
-            return status(config, args.compact)
+            return status(config, args.compact, args.json)
 
         if args.command == "switch" and not args.yes:
             if not args.confirm:

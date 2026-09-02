@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import configparser
 import json
 import unittest
 import xml.etree.ElementTree as ElementTree
@@ -49,6 +50,18 @@ class AssetTest(unittest.TestCase):
         assert defaults is not None
         self.assertEqual(defaults.findtext("allow_active"), "yes")
         self.assertEqual(defaults.findtext("allow_inactive"), "no")
+
+    def test_restore_display_autostart_only_runs_under_niri(self) -> None:
+        entry_path = PROJECT / "autostart/cachyos-gamemode-restore-display.desktop"
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read_string(entry_path.read_text(encoding="utf-8"))
+        entry = parser["Desktop Entry"]
+        self.assertEqual(entry["Type"], "Application")
+        self.assertEqual(entry["OnlyShowIn"], "niri;")
+        self.assertEqual(
+            entry["Exec"],
+            "/usr/local/bin/cachyos-sessionctl display restore-desktop",
+        )
 
 
 if __name__ == "__main__":

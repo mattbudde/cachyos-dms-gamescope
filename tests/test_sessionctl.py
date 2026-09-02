@@ -27,9 +27,12 @@ class IntegrationTest(unittest.TestCase):
             / "var/cache/dms-greeter/.local/state/memory.json"
         )
         self.runfile = self.root / "run/greetd.run"
+        self.config_home = self.root / "home/.config"
+        self.display_conf = self.config_home / "cachyos-gamemode/display.conf"
         self.config.parent.mkdir(parents=True)
         self.memory.parent.mkdir(parents=True)
         self.runfile.parent.mkdir(parents=True)
+        self.config_home.mkdir(parents=True)
         self.config.write_text(
             "\n".join(
                 (
@@ -57,6 +60,7 @@ class IntegrationTest(unittest.TestCase):
             {
                 "CACHYOS_GAMEMODE_TESTING": "1",
                 "CACHYOS_GAMEMODE_TEST_ROOT": str(self.root),
+                "XDG_CONFIG_HOME": str(self.config_home),
                 "XDG_CURRENT_DESKTOP": "niri",
             }
         )
@@ -162,6 +166,185 @@ class IntegrationTest(unittest.TestCase):
         self.assertIn("Active: niri", result.stdout)
         self.assertIn("next/remembered: niri.desktop", result.stdout)
 
+    def test_display_set_persists_connector_without_auto(self) -> None:
+        result = self.run_sessionctl("display", "set", "gamescope", "DP-1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_sessionctl("display", "set", "desktop", "eDP-1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.display_conf.read_text(encoding="utf-8"),
+            "[display]\ngamescope_output = DP-1\ndesktop_primary = eDP-1\n",
+        )
+
+        result = self.run_sessionctl("display", "prefer-output")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "DP-1,*\n")
+
+        result = self.run_sessionctl("display", "set", "gamescope", "auto")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.display_conf.read_text(encoding="utf-8"),
+            "[display]\ndesktop_primary = eDP-1\n",
+        )
+        result = self.run_sessionctl("display", "prefer-output")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_display_prefer_output_is_empty_without_a_preference(self) -> None:
+        result = self.run_sessionctl("display", "prefer-output")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(self.display_conf.exists())
+
+    def test_display_set_rejects_unsafe_connectors(self) -> None:
+        for value in ("*", "DP-1,*", "DP 1", "DP-1=x", '"DP-1"', "/dev/dri/card0", "", "eDP"):
+            with self.subTest(value=value):
+                result = self.run_sessionctl("display", "set", "gamescope", value)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("not a DRM connector name", result.stderr)
+        self.assertFalse(self.display_conf.exists())
+
+    def test_display_set_accepts_common_connector_names(self) -> None:
+        for value in ("eDP-1", "DP-1", "HDMI-A-1", "DVI-D-2"):
+            with self.subTest(value=value):
+                result = self.run_sessionctl("display", "set", "gamescope", value)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_display_prefer_output_fails_on_a_corrupt_file(self) -> None:
+        self.display_conf.parent.mkdir(parents=True)
+        self.display_conf.write_text("[display]\ngamescope_output = DP-1,*\n", encoding="utf-8")
+        result = self.run_sessionctl("display", "prefer-output")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not a DRM connector name", result.stderr)
+
+    def test_status_json_reports_display_preferences(self) -> None:
+        self.run_sessionctl("display", "set", "gamescope", "HDMI-A-1")
+        result = self.run_sessionctl("status", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["active"], "niri")
+        self.assertEqual(report["remembered"], "niri.desktop")
+        self.assertEqual(
+            report["display"],
+            {
+                "gamescope_output": "HDMI-A-1",
+                "gamescope_prefer_output": "HDMI-A-1,*",
+                "desktop_primary": None,
+            },
+        )
+
+    def make_fake_niri(
+        self,
+        first_outputs: dict[str, object],
+        later_outputs: dict[str, object] | None = None,
+    ) -> Path:
+        bin_dir = self.root / "fake-bin"
+        bin_dir.mkdir(exist_ok=True)
+        replies = self.root / "niri-replies"
+        replies.mkdir(exist_ok=True)
+        (replies / "next.json").write_text(json.dumps(first_outputs), encoding="utf-8")
+        if later_outputs is not None:
+            (replies / "after.json").write_text(json.dumps(later_outputs), encoding="utf-8")
+        log = self.root / "niri.log"
+        (bin_dir / "niri").write_text(
+            f"""#!/usr/bin/env sh
+printf '%s\\n' "$*" >> {log}
+case "$*" in
+    "msg --json outputs")
+        cat {replies}/next.json
+        [ -e {replies}/after.json ] && mv -f {replies}/after.json {replies}/next.json
+        ;;
+    "msg action focus-monitor "*) ;;
+    *) exit 2 ;;
+esac
+exit 0
+""",
+            encoding="utf-8",
+        )
+        (bin_dir / "niri").chmod(0o755)
+        return log
+
+    def niri_environment(self, desktop: str = "niri") -> dict[str, str]:
+        return self.environment | {
+            "PATH": f"{self.root / 'fake-bin'}:{self.environment['PATH']}",
+            "XDG_CURRENT_DESKTOP": desktop,
+        }
+
+    def niri_calls(self, log: Path) -> list[str]:
+        if not log.exists():
+            return []
+        return log.read_text(encoding="utf-8").splitlines()
+
+    @staticmethod
+    def enabled(*names: str) -> dict[str, object]:
+        return {name: {"name": name, "logical": {"x": 0, "y": 0}} for name in names}
+
+    def test_restore_desktop_is_a_no_op_outside_niri(self) -> None:
+        log = self.make_fake_niri(self.enabled("DP-1"))
+        result = self.run_sessionctl(
+            "display", "restore-desktop", environment=self.niri_environment("KDE")
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.niri_calls(log), [])
+
+    def test_restore_desktop_focuses_the_internal_panel_by_default(self) -> None:
+        log = self.make_fake_niri(self.enabled("HDMI-A-1", "eDP-1", "DP-2"))
+        result = self.run_sessionctl(
+            "display", "restore-desktop", environment=self.niri_environment()
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.niri_calls(log),
+            ["msg --json outputs", "msg action focus-monitor eDP-1"],
+        )
+
+    def test_restore_desktop_falls_back_to_the_first_name_without_a_panel(self) -> None:
+        log = self.make_fake_niri(self.enabled("HDMI-A-1", "DP-2", "DP-1"))
+        result = self.run_sessionctl(
+            "display", "restore-desktop", environment=self.niri_environment()
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("msg action focus-monitor DP-1", self.niri_calls(log))
+
+    def test_restore_desktop_prefers_the_saved_primary_when_connected(self) -> None:
+        self.run_sessionctl("display", "set", "desktop", "DP-2")
+        self.run_sessionctl("display", "set", "gamescope", "HDMI-A-1")
+        log = self.make_fake_niri(self.enabled("HDMI-A-1", "eDP-1", "DP-2"))
+        result = self.run_sessionctl(
+            "display", "restore-desktop", environment=self.niri_environment()
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("msg action focus-monitor DP-2", self.niri_calls(log))
+
+    def test_restore_desktop_ignores_a_disconnected_saved_primary(self) -> None:
+        self.run_sessionctl("display", "set", "desktop", "DP-9")
+        outputs = self.enabled("DP-1", "eDP-1")
+        outputs["DP-3"] = {"name": "DP-3", "logical": None}
+        log = self.make_fake_niri(outputs)
+        result = self.run_sessionctl(
+            "display", "restore-desktop", environment=self.niri_environment()
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("msg action focus-monitor eDP-1", self.niri_calls(log))
+
+    def test_restore_desktop_retries_until_niri_reports_outputs(self) -> None:
+        log = self.make_fake_niri({}, later_outputs=self.enabled("DP-1"))
+        result = self.run_sessionctl(
+            "display", "restore-desktop", environment=self.niri_environment()
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.niri_calls(log),
+            ["msg --json outputs", "msg --json outputs", "msg action focus-monitor DP-1"],
+        )
+
+    def test_status_reports_display_lines(self) -> None:
+        self.run_sessionctl("display", "set", "desktop", "eDP-1")
+        result = self.run_sessionctl("status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Gamescope output:   auto", result.stdout)
+        self.assertIn("Desktop primary:    eDP-1", result.stdout)
+
     @unittest.skipIf(os.geteuid() == 0, "root helper test mode is intentionally disabled")
     def test_privileged_helper_rearms_runfile_in_test_mode(self) -> None:
         self.runfile.touch()
@@ -176,34 +359,56 @@ class IntegrationTest(unittest.TestCase):
         self.assertFalse(self.runfile.exists())
         self.assertIn("would restart greetd.service", result.stdout)
 
-    def test_gamescope_launcher_clears_stale_desktop_environment(self) -> None:
-        checker = self.root / "check-gamescope-environment"
-        checker.write_text(
-            """#!/usr/bin/env sh
-for name in WAYLAND_DISPLAY DISPLAY XAUTHORITY NIRI_SOCKET SWAYSOCK HYPRLAND_INSTANCE_SIGNATURE; do
+    STALE_DESKTOP_ENVIRONMENT = {
+        "WAYLAND_DISPLAY": "wayland-1",
+        "DISPLAY": ":0",
+        "XAUTHORITY": "/tmp/old-xauthority",
+        "NIRI_SOCKET": "/run/user/1000/niri.sock",
+        "SWAYSOCK": "/run/user/1000/sway.sock",
+        "HYPRLAND_INSTANCE_SIGNATURE": "old-session",
+        "OUTPUT_CONNECTOR": "HDMI-A-2,*",
+    }
+    UNSET_CHECK = """
+for name in WAYLAND_DISPLAY DISPLAY XAUTHORITY NIRI_SOCKET SWAYSOCK HYPRLAND_INSTANCE_SIGNATURE OUTPUT_CONNECTOR; do
     eval 'test -z "${'"$name"'+x}"' || exit 10
 done
-""",
-            encoding="utf-8",
-        )
+"""
+
+    def run_gamescope_start(self, checker_body: str) -> subprocess.CompletedProcess[str]:
+        checker = self.root / "check-gamescope-environment"
+        checker.write_text(f"#!/usr/bin/env sh\n{checker_body}\n", encoding="utf-8")
         checker.chmod(0o755)
-        environment = self.environment | {
+        environment = self.environment | self.STALE_DESKTOP_ENVIRONMENT | {
             "CACHYOS_GAMEMODE_TEST_START": str(checker),
-            "WAYLAND_DISPLAY": "wayland-1",
-            "DISPLAY": ":0",
-            "XAUTHORITY": "/tmp/old-xauthority",
-            "NIRI_SOCKET": "/run/user/1000/niri.sock",
-            "SWAYSOCK": "/run/user/1000/sway.sock",
-            "HYPRLAND_INSTANCE_SIGNATURE": "old-session",
         }
-        result = subprocess.run(
+        return subprocess.run(
             [str(GAMESCOPE_START)],
             check=False,
             capture_output=True,
             text=True,
             env=environment,
         )
+
+    def test_gamescope_launcher_clears_stale_desktop_environment(self) -> None:
+        result = self.run_gamescope_start(self.UNSET_CHECK)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_gamescope_launcher_exports_the_saved_output_connector(self) -> None:
+        self.run_sessionctl("display", "set", "gamescope", "DP-1")
+        result = self.run_gamescope_start('[ "$OUTPUT_CONNECTOR" = "DP-1,*" ] || exit 11')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_gamescope_launcher_leaves_output_connector_unset_on_auto(self) -> None:
+        self.run_sessionctl("display", "set", "desktop", "eDP-1")
+        result = self.run_gamescope_start(self.UNSET_CHECK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_gamescope_launcher_starts_despite_a_corrupt_preference(self) -> None:
+        self.display_conf.parent.mkdir(parents=True)
+        self.display_conf.write_text("not an ini file\n", encoding="utf-8")
+        result = self.run_gamescope_start(self.UNSET_CHECK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("using Gamescope defaults", result.stderr)
 
 
 if __name__ == "__main__":

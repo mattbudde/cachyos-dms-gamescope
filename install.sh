@@ -65,6 +65,7 @@ state_dir="$user_home/.local/state/cachyos-gamemode"
 state_file="$state_dir/install-state.json"
 plugin_dir="$user_home/.config/DankMaterialShell/plugins/cachyosGameMode"
 guard_file="$user_home/.config/inhibit-short-session-tracker"
+autostart_file="$user_home/.config/autostart/cachyos-gamemode-restore-display.desktop"
 
 say() {
     printf '%s\n' "$*"
@@ -255,6 +256,11 @@ if [[ -d $plugin_dir ]] && ! rg -q '"id"[[:space:]]*:[[:space:]]*"cachyosGameMod
     printf 'Refusing to overwrite unrelated plugin directory: %s\n' "$plugin_dir" >&2
     exit 1
 fi
+if [[ -e $autostart_file ]] \
+    && ! rg -qF 'cachyos-sessionctl display restore-desktop' "$autostart_file" 2>/dev/null; then
+    printf 'Refusing to overwrite unrelated file: %s\n' "$autostart_file" >&2
+    exit 1
+fi
 
 if [[ ! -d /var/cache/dms-greeter/.local/state \
     || ! -w /var/cache/dms-greeter/.local/state ]]; then
@@ -304,6 +310,10 @@ if ! $guard_was_present; then
     say 'Enabling the Steam short-session repair guard for initial testing...'
     run install -D -m 0644 /dev/null "$guard_file"
 fi
+
+say 'Installing the niri desktop display restore autostart entry...'
+run install -D -m 0644 \
+    "$project_dir/autostart/cachyos-gamemode-restore-display.desktop" "$autostart_file"
 
 if $install_plugin; then
     say 'Installing DMS launcher/bar plugin...'
