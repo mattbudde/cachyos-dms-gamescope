@@ -18,7 +18,25 @@ sessionctl="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/cachyos-sessio
 if ! prefer_output="$("$sessionctl" display prefer-output)"; then
     printf '%s\n' 'start-gamescope-session: display preference unavailable; using Gamescope defaults' >&2
     prefer_output=""
+    prefer_mode=""
+elif ! prefer_mode="$("$sessionctl" display prefer-mode)"; then
+    printf '%s\n' 'start-gamescope-session: display preference unavailable; using Gamescope defaults' >&2
+    prefer_mode=""
 fi
+
+install_output_mode_wrapper() {
+    # The package start-gamescope-session execs `gamescope` from PATH with no -W/-H.
+    local real_gamescope wrapper_dir
+    real_gamescope="$(command -v gamescope)" || return 0
+    wrapper_dir="$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/cachyos-gamescope-mode.XXXXXX")"
+    cat > "$wrapper_dir/gamescope" <<'EOF'
+#!/bin/sh
+exec "$CACHYOS_GAMESCOPE_BIN" -W "$CACHYOS_GAMESCOPE_W" -H "$CACHYOS_GAMESCOPE_H" -r "$CACHYOS_GAMESCOPE_R" "$@"
+EOF
+    chmod +x "$wrapper_dir/gamescope"
+    export CACHYOS_GAMESCOPE_BIN="$real_gamescope"
+    export PATH="$wrapper_dir:$PATH"
+}
 
 if [[ ${CACHYOS_GAMEMODE_TESTING:-0} != 1 ]]; then
     systemctl --user unset-environment "${stale_variables[@]}"
@@ -33,5 +51,11 @@ fi
 unset "${stale_variables[@]}"
 if [[ -n $prefer_output ]]; then
     export OUTPUT_CONNECTOR="$prefer_output"
+fi
+if [[ $prefer_mode =~ ^([1-9][0-9]*)x([1-9][0-9]*)@([1-9][0-9]*)$ ]]; then
+    export CACHYOS_GAMESCOPE_W="${BASH_REMATCH[1]}"
+    export CACHYOS_GAMESCOPE_H="${BASH_REMATCH[2]}"
+    export CACHYOS_GAMESCOPE_R="${BASH_REMATCH[3]}"
+    install_output_mode_wrapper
 fi
 exec "$start_command" "$@"

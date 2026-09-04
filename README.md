@@ -112,6 +112,8 @@ cachyos-sessionctl set desktop
 cachyos-sessionctl display list                  # connected monitors, on or off on the desktop
 cachyos-sessionctl display set gamescope DP-1    # Gamescope starts on DP-1 when connected
 cachyos-sessionctl display set gamescope auto    # back to the Gamescope package default
+cachyos-sessionctl display set mode 1920x1080@60 # pin the DRM mode Gamescope should modeset
+cachyos-sessionctl display set mode auto         # back to Gamescope's EDID preferred mode
 cachyos-sessionctl display set desktop eDP-1     # niri focuses eDP-1 after every login
 cachyos-sessionctl display set desktop auto      # internal panel if present, else first by name
 cachyos-sessionctl status                        # shows both choices
@@ -129,7 +131,10 @@ pick one before **Enter Game Mode**. The choice is stored in
 `~/.config/cachyos-gamemode/display.conf` and survives reinstalls and
 uninstalls. When Gamescope starts, the launcher shim passes the chosen
 connector as `OUTPUT_CONNECTOR=NAME,*`, so an unplugged monitor falls back to
-any connected output. When niri starts, an autostart entry runs
+any connected output. A pinned `gamescope_mode` is passed as `-W -H -r` so
+Gamescope modesets that size instead of the EDID preferred mode. Without it,
+a TV whose EDID prefers 4K can stay black even when niri is already at 1080p.
+When niri starts, an autostart entry runs
 `cachyos-sessionctl display restore-desktop`, which focuses the desktop
 primary; under any other desktop it exits without doing anything.
 
@@ -232,6 +237,16 @@ cachyos-sessionctl doctor
 If the plugin is loaded but absent from the bar, add it in the DankBar Layout
 settings. After changing plugin files during development, `dms restart` clears
 Quickshell's external-component cache.
+
+If Game Mode comes up black on a TV that works at 1080p on the desktop, pin
+that mode before the next switch:
+
+```bash
+cachyos-sessionctl display set mode 1920x1080@60
+```
+
+Gamescope otherwise follows the EDID preferred mode, which can be 4K even when
+niri is already driving the same connector at 1080p.
 
 ## Development checks
 
