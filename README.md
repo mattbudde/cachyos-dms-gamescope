@@ -109,6 +109,7 @@ cachyos-sessionctl set desktop
 ## Choosing a Game Mode monitor
 
 ```bash
+cachyos-sessionctl display list                  # connected monitors, on or off on the desktop
 cachyos-sessionctl display set gamescope DP-1    # Gamescope starts on DP-1 when connected
 cachyos-sessionctl display set gamescope auto    # back to the Gamescope package default
 cachyos-sessionctl display set desktop eDP-1     # niri focuses eDP-1 after every login
@@ -116,7 +117,14 @@ cachyos-sessionctl display set desktop auto      # internal panel if present, el
 cachyos-sessionctl status                        # shows both choices
 ```
 
-The DankBar popout lists the connected monitors under **Game Mode monitor**;
+`display list` and the DankBar popout show every monitor niri reports as
+connected, including one you have turned off on the desktop. A TV that is off
+in niri is still a valid Game Mode monitor: Gamescope drives it directly, so
+it appears marked `off` (or "off on desktop" in the popout) and can be pinned.
+Under any other desktop, `display list` prints one line and exits without
+listing anything.
+
+The DankBar popout lists those monitors under **Game Mode monitor**;
 pick one before **Enter Game Mode**. The choice is stored in
 `~/.config/cachyos-gamemode/display.conf` and survives reinstalls and
 uninstalls. When Gamescope starts, the launcher shim passes the chosen

@@ -64,6 +64,19 @@ class DisplayPreferences:
 
 
 @dataclass(frozen=True)
+class Monitor:
+    connector: Connector
+    enabled: bool
+    make: str | None
+    model: str | None
+    serial: str | None
+
+    @property
+    def label(self) -> str:
+        return self.model or self.make or self.connector
+
+
+@dataclass(frozen=True)
 class Check:
     id: str
     status: CheckStatus
@@ -284,7 +297,28 @@ def niri_session_active() -> bool:
     return "niri" in desktops
 
 
-def niri_outputs() -> tuple[Connector, ...]:
+def optional_text(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def parse_niri_outputs(reply: object) -> tuple[Monitor, ...]:
+    if not isinstance(reply, dict):
+        raise SessionError("niri outputs reply is not a JSON object")
+    monitors = [
+        Monitor(
+            connector=parse_connector(name),
+            enabled=output.get("logical") is not None,
+            make=optional_text(output.get("make")),
+            model=optional_text(output.get("model")),
+            serial=optional_text(output.get("serial")),
+        )
+        for name, output in reply.items()
+        if isinstance(output, dict)
+    ]
+    return tuple(sorted(monitors, key=lambda monitor: monitor.connector))
+
+
+def niri_monitors() -> tuple[Monitor, ...]:
     try:
         result = subprocess.run(
             ["niri", "msg", "--json", "outputs"],
@@ -300,13 +334,56 @@ def niri_outputs() -> tuple[Connector, ...]:
         reply = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise SessionError(f"invalid niri outputs reply: {exc}") from exc
-    if not isinstance(reply, dict):
-        raise SessionError("niri outputs reply is not a JSON object")
-    return tuple(
-        parse_connector(name)
-        for name, output in reply.items()
-        if isinstance(output, dict) and output.get("logical") is not None
+    return parse_niri_outputs(reply)
+
+
+def niri_monitors_or_none() -> tuple[Monitor, ...] | None:
+    try:
+        return niri_monitors()
+    except SessionError:
+        return None
+
+
+def enabled_connectors(monitors: Sequence[Monitor]) -> tuple[Connector, ...]:
+    return tuple(monitor.connector for monitor in monitors if monitor.enabled)
+
+
+def find_monitor(monitors: Sequence[Monitor], connector: Connector | None) -> Monitor | None:
+    return next((monitor for monitor in monitors if monitor.connector == connector), None)
+
+
+def monitor_report(
+    monitors: Sequence[Monitor] | None, preferences: DisplayPreferences
+) -> list[dict[str, object]] | None:
+    if monitors is None:
+        return None
+    rows: list[dict[str, object]] = [
+        {
+            "connector": monitor.connector,
+            "label": monitor.label,
+            "enabled": monitor.enabled,
+            "present": True,
+        }
+        for monitor in monitors
+    ]
+    pinned = preferences.gamescope_output
+    if pinned is not None and find_monitor(monitors, pinned) is None:
+        rows.append({"connector": pinned, "label": pinned, "enabled": False, "present": False})
+    return rows
+
+
+def monitor_roles(connector: object, preferences: DisplayPreferences) -> str:
+    return ", ".join(
+        target
+        for target, field in DISPLAY_FIELDS.items()
+        if getattr(preferences, field) == connector
     )
+
+
+def desktop_state(row: dict[str, object]) -> str:
+    if row["enabled"]:
+        return "on"
+    return "off" if row["present"] else "unplugged"
 
 
 def niri_focus_monitor(connector: Connector) -> None:
@@ -325,15 +402,35 @@ def restore_desktop_display(preferences: DisplayPreferences) -> int:
         print("Not a niri session; nothing to restore.")
         return 0
     deadline = time.monotonic() + NIRI_OUTPUTS_RETRY_SECONDS
-    outputs = niri_outputs()
+    outputs = enabled_connectors(niri_monitors())
     while not outputs and time.monotonic() < deadline:
         time.sleep(NIRI_OUTPUTS_RETRY_INTERVAL)
-        outputs = niri_outputs()
+        outputs = enabled_connectors(niri_monitors())
     primary = resolve_desktop_primary(preferences, outputs)
     if primary is None:
         raise SessionError("niri reported no enabled outputs")
     niri_focus_monitor(primary)
     print(f"Focused {primary}.")
+    return 0
+
+
+def display_list(preferences: DisplayPreferences) -> int:
+    if not niri_session_active():
+        print("Not a niri session; monitors can only be listed from the niri desktop.")
+        return 0
+    rows = monitor_report(niri_monitors(), preferences) or []
+    lines = [("CONNECTOR", "DESKTOP", "MONITOR", "ROLE")] + [
+        (
+            str(row["connector"]),
+            desktop_state(row),
+            str(row["label"]),
+            monitor_roles(row["connector"], preferences),
+        )
+        for row in rows
+    ]
+    widths = [max(len(line[column]) for line in lines) for column in range(len(lines[0]))]
+    for line in lines:
+        print("  ".join(cell.ljust(width) for cell, width in zip(line, widths)).rstrip())
     return 0
 
 
@@ -357,6 +454,8 @@ def display_command(args: argparse.Namespace) -> int:
         if prefer_output is not None:
             print(prefer_output)
         return 0
+    if args.display_command == "list":
+        return display_list(preferences)
     return restore_desktop_display(preferences)
 
 
@@ -437,6 +536,7 @@ def status(config: Config, compact: bool, as_json: bool) -> int:
     preferences = read_display_preferences(display_preferences_path())
     prefer_output = gamescope_prefer_output(preferences)
     if as_json:
+        monitors = niri_monitors_or_none() if niri_session_active() else None
         report = {
             "active": active,
             "remembered": selected,
@@ -444,6 +544,7 @@ def status(config: Config, compact: bool, as_json: bool) -> int:
                 "gamescope_output": preferences.gamescope_output,
                 "gamescope_prefer_output": prefer_output,
                 "desktop_primary": preferences.desktop_primary,
+                "monitors": monitor_report(monitors, preferences),
             },
         }
         print(json.dumps(report, indent=2, sort_keys=True))
@@ -818,33 +919,47 @@ def check_autostart() -> Check:
     return Check("autostart", "ok", str(path))
 
 
-def check_gamescope_output() -> Check:
-    path = display_preferences_path()
+def check_gamescope_output(
+    preferences: DisplayPreferences, monitors: Sequence[Monitor]
+) -> Check:
+    connector = preferences.gamescope_output
+    if connector is None:
+        return Check("gamescope-output", "ok", "auto")
+    monitor = find_monitor(monitors, connector)
+    if monitor is None:
+        return Check(
+            "gamescope-output",
+            "warn",
+            f"{connector} is not connected; Gamescope will fall back to any output",
+            f"cachyos-sessionctl display set gamescope {AUTO}",
+        )
+    if monitor.enabled:
+        return Check("gamescope-output", "ok", f"{connector} is connected")
+    return Check(
+        "gamescope-output",
+        "ok",
+        f"{connector} is connected (off on the desktop; Gamescope drives it directly)",
+    )
+
+
+def probe_gamescope_output() -> Check:
     try:
-        preferences = read_display_preferences(path)
+        preferences = read_display_preferences(display_preferences_path())
     except SessionError as exc:
         return Check("gamescope-output", "fail", str(exc))
     if preferences.gamescope_output is None:
-        return Check("gamescope-output", "ok", "auto")
-    connector = preferences.gamescope_output
+        return check_gamescope_output(preferences, ())
     if not niri_session_active():
         return Check(
             "gamescope-output",
             "warn",
-            f"{connector} is pinned; cannot verify it outside niri",
+            f"{preferences.gamescope_output} is pinned; cannot verify it outside niri",
         )
     try:
-        outputs = niri_outputs()
+        monitors = niri_monitors()
     except SessionError as exc:
         return Check("gamescope-output", "warn", f"cannot query niri outputs: {exc}")
-    if connector in outputs:
-        return Check("gamescope-output", "ok", f"{connector} is connected")
-    return Check(
-        "gamescope-output",
-        "warn",
-        f"{connector} is not connected; Gamescope will fall back to any output",
-        f"cachyos-sessionctl display set gamescope {AUTO}",
-    )
+    return check_gamescope_output(preferences, monitors)
 
 
 def check_short_session() -> Check:
@@ -911,7 +1026,7 @@ def collect_doctor_checks() -> list[Check]:
         check_plugin_enabled,
         check_plugin_widget,
         check_autostart,
-        check_gamescope_output,
+        probe_gamescope_output,
         check_short_session,
         check_os,
     ):
@@ -996,6 +1111,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     display_set_parser.add_argument("target", choices=tuple(DISPLAY_FIELDS))
     display_set_parser.add_argument("connector", metavar="CONNECTOR|auto")
+    display_commands.add_parser(
+        "list", help="show connected monitors, on or off on the desktop"
+    )
     display_commands.add_parser(
         "prefer-output", help="print the Gamescope OUTPUT_CONNECTOR value, if any"
     )
