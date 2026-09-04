@@ -14,17 +14,23 @@ PluginComponent {
     property string statusText: "Checking session status..."
     property bool actionRunning: false
     property string gamescopeOutput: "auto"
+    property var monitors: []
 
     readonly property var monitorChoices: {
         const choices = [{ connector: "auto", label: "Auto", detail: "Gamescope default" }]
-        const screens = Quickshell.screens
         const thisScreen = root.parentScreen ? root.parentScreen.name : ""
-        for (let i = 0; i < screens.length; i++) {
-            const screen = screens[i]
+        for (const monitor of root.monitors) {
+            const detail = [monitor.label]
+            if (!monitor.present)
+                detail.push("not connected")
+            else if (!monitor.enabled)
+                detail.push("off on desktop")
+            if (monitor.connector === thisScreen)
+                detail.push("(this screen)")
             choices.push({
-                connector: screen.name,
-                label: screen.name,
-                detail: (screen.model || "") + (screen.name === thisScreen ? " (this screen)" : "")
+                connector: monitor.connector,
+                label: monitor.connector,
+                detail: detail.join(" · ")
             })
         }
         return choices
@@ -75,6 +81,7 @@ PluginComponent {
                     const report = JSON.parse(output)
                     root.statusText = "Active: " + report.active + "; next/remembered: " + report.remembered
                     root.gamescopeOutput = report.display.gamescope_output || "auto"
+                    root.monitors = report.display.monitors || []
                 } catch (error) {
                     root.statusText = output
                 }
