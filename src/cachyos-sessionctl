@@ -36,6 +36,8 @@ GUARD_RELATIVE = Path("inhibit-short-session-tracker")
 PLUGIN_ID = "cachyosGameMode"
 POLKIT_ACTION = "org.cachyos.gamemode.switch-session"
 AUTOSTART_EXEC_MARKER = "cachyos-sessionctl display restore-desktop"
+PNP_IDS_PATH = Path("/usr/share/hwdata/pnp.ids")
+GAMESCOPE_MODE_SAVE_RELATIVE = Path("gamescope/modes.cfg")
 AUTOLOGIN_SETTINGS = (
     "greeterAutoLogin",
     "greeterRememberLastUser",
@@ -74,6 +76,8 @@ class DisplayPreferences:
     gamescope_output: Connector | None = None
     desktop_primary: Connector | None = None
     gamescope_mode: GamescopeMode | None = None
+    gamescope_make: str | None = None
+    gamescope_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -284,7 +288,18 @@ def read_display_preferences(path: Path) -> DisplayPreferences:
     }
     if "gamescope_mode" in section:
         values["gamescope_mode"] = parse_gamescope_mode(section["gamescope_mode"].strip())
+    if "gamescope_make" in section:
+        values["gamescope_make"] = parse_identity(section["gamescope_make"])
+    if "gamescope_model" in section:
+        values["gamescope_model"] = parse_identity(section["gamescope_model"])
     return DisplayPreferences(**values)
+
+
+def parse_identity(text: str) -> str:
+    value = text.strip()
+    if not value or "\n" in value or ":" in value:
+        raise SessionError(f"invalid display identity: {text!r}")
+    return value
 
 
 def write_display_preferences(path: Path, preferences: DisplayPreferences) -> None:
@@ -295,6 +310,10 @@ def write_display_preferences(path: Path, preferences: DisplayPreferences) -> No
             lines.append(f"{field} = {value}")
     if preferences.gamescope_mode is not None:
         lines.append(f"gamescope_mode = {preferences.gamescope_mode}")
+    if preferences.gamescope_make is not None:
+        lines.append(f"gamescope_make = {preferences.gamescope_make}")
+    if preferences.gamescope_model is not None:
+        lines.append(f"gamescope_model = {preferences.gamescope_model}")
     atomic_write(path, ("\n".join(lines) + "\n").encode("utf-8"))
 
 
@@ -308,6 +327,69 @@ def gamescope_prefer_mode(preferences: DisplayPreferences) -> str | None:
     if preferences.gamescope_mode is None:
         return None
     return str(preferences.gamescope_mode)
+
+
+def pnp_id_for_make(make: str) -> str | None:
+    path = rooted(PNP_IDS_PATH)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if not line or line.startswith("#") or "\t" not in line:
+            continue
+        pnp_id, name = line.split("\t", 1)
+        if name.strip() == make:
+            return pnp_id.strip()
+    return None
+
+
+def gamescope_sink_descriptions(preferences: DisplayPreferences) -> tuple[str, ...]:
+    make = preferences.gamescope_make
+    model = preferences.gamescope_model
+    descriptions: list[str] = []
+    if make and model:
+        descriptions.append(f"{make} {model}")
+        pnp_id = pnp_id_for_make(make)
+        if pnp_id:
+            descriptions.append(f"{pnp_id} {model}")
+    elif model:
+        descriptions.append(model)
+    descriptions.append("External screen")
+    seen: set[str] = set()
+    unique: list[str] = []
+    for description in descriptions:
+        if description not in seen:
+            seen.add(description)
+            unique.append(description)
+    return tuple(unique)
+
+
+def gamescope_mode_save_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    return Path(base) / GAMESCOPE_MODE_SAVE_RELATIVE
+
+
+def apply_gamescope_mode_save(preferences: DisplayPreferences) -> int:
+    if preferences.gamescope_mode is None:
+        return 0
+    path = gamescope_mode_save_path()
+    descriptions = gamescope_sink_descriptions(preferences)
+    prefixes = tuple(f"{description}:" for description in descriptions)
+    existing: list[str] = []
+    try:
+        existing = [
+            line
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line and not line.startswith(prefixes)
+        ]
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise SessionError(f"cannot read Gamescope mode save {path}: {exc}") from exc
+    lines = existing + [f"{description}:{preferences.gamescope_mode}" for description in descriptions]
+    atomic_write(path, ("\n".join(lines) + "\n").encode("utf-8"))
+    return 0
 
 
 def default_primary(outputs: Sequence[Connector]) -> Connector | None:
@@ -353,9 +435,15 @@ def parse_niri_outputs(reply: object) -> tuple[Monitor, ...]:
 
 
 def niri_monitors() -> tuple[Monitor, ...]:
+    niri = shutil.which("niri")
+    if niri is None:
+        raise SessionError("cannot query niri outputs: niri not found")
+    root = test_root()
+    if root is not None and not Path(niri).resolve().is_relative_to(root.resolve()):
+        raise SessionError("cannot query niri outputs: live niri is hidden in tests")
     try:
         result = subprocess.run(
-            ["niri", "msg", "--json", "outputs"],
+            [niri, "msg", "--json", "outputs"],
             check=False,
             capture_output=True,
             text=True,
@@ -376,10 +464,6 @@ def niri_monitors_or_none() -> tuple[Monitor, ...] | None:
         return niri_monitors()
     except SessionError:
         return None
-
-
-def enabled_connectors(monitors: Sequence[Monitor]) -> tuple[Connector, ...]:
-    return tuple(monitor.connector for monitor in monitors if monitor.enabled)
 
 
 def find_monitor(monitors: Sequence[Monitor], connector: Connector | None) -> Monitor | None:
@@ -431,20 +515,44 @@ def niri_focus_monitor(connector: Connector) -> None:
         raise SessionError(f"niri focus-monitor {connector} failed with status {result.returncode}")
 
 
+def niri_output_power(connector: Connector, enabled: bool) -> None:
+    action = "on" if enabled else "off"
+    try:
+        result = subprocess.run(
+            ["niri", "msg", "output", connector, action], check=False
+        )
+    except OSError as exc:
+        raise SessionError(f"cannot set niri output {connector}: {exc}") from exc
+    if result.returncode != 0:
+        raise SessionError(
+            f"niri output {connector} {action} failed with status {result.returncode}"
+        )
+
+
 def restore_desktop_display(preferences: DisplayPreferences) -> int:
     if not niri_session_active():
         print("Not a niri session; nothing to restore.")
         return 0
     deadline = time.monotonic() + NIRI_OUTPUTS_RETRY_SECONDS
-    outputs = enabled_connectors(niri_monitors())
-    while not outputs and time.monotonic() < deadline:
+    monitors = niri_monitors()
+    while not monitors and time.monotonic() < deadline:
         time.sleep(NIRI_OUTPUTS_RETRY_INTERVAL)
-        outputs = enabled_connectors(niri_monitors())
-    primary = resolve_desktop_primary(preferences, outputs)
+        monitors = niri_monitors()
+    connectors = tuple(monitor.connector for monitor in monitors)
+    primary = resolve_desktop_primary(preferences, connectors)
     if primary is None:
-        raise SessionError("niri reported no enabled outputs")
+        raise SessionError("niri reported no connected outputs")
+    niri_output_power(primary, True)
+    disabled = tuple(
+        connector for connector in sorted(connectors) if connector != primary
+    )
+    for connector in disabled:
+        niri_output_power(connector, False)
     niri_focus_monitor(primary)
-    print(f"Focused {primary}.")
+    if disabled:
+        print(f"Desktop on {primary}; disabled {', '.join(disabled)}.")
+    else:
+        print(f"Focused {primary}.")
     return 0
 
 
@@ -468,11 +576,35 @@ def display_list(preferences: DisplayPreferences) -> int:
     return 0
 
 
+def remember_gamescope_identity(
+    connector: Connector | None, current: DisplayPreferences
+) -> tuple[str | None, str | None]:
+    if connector is None:
+        return None, None
+    monitors = niri_monitors_or_none()
+    if monitors:
+        monitor = find_monitor(monitors, connector)
+        if monitor is not None:
+            return monitor.make, monitor.model
+    if current.gamescope_output == connector:
+        return current.gamescope_make, current.gamescope_model
+    return None, None
+
+
 def display_set(target: str, value: str) -> int:
     path = display_preferences_path()
     current = read_display_preferences(path)
     if target == "mode":
         preferences = replace(current, gamescope_mode=parse_gamescope_mode_or_auto(value))
+    elif target == "gamescope":
+        connector = parse_connector_or_auto(value)
+        make, model = remember_gamescope_identity(connector, current)
+        preferences = replace(
+            current,
+            gamescope_output=connector,
+            gamescope_make=make,
+            gamescope_model=model,
+        )
     else:
         preferences = replace(current, **{DISPLAY_FIELDS[target]: parse_connector_or_auto(value)})
     write_display_preferences(path, preferences)
@@ -494,6 +626,8 @@ def display_command(args: argparse.Namespace) -> int:
         if prefer_mode is not None:
             print(prefer_mode)
         return 0
+    if args.display_command == "apply-mode-save":
+        return apply_gamescope_mode_save(preferences)
     if args.display_command == "list":
         return display_list(preferences)
     return restore_desktop_display(preferences)
@@ -1164,7 +1298,12 @@ def build_parser() -> argparse.ArgumentParser:
         "prefer-mode", help="print the Gamescope output mode, if any"
     )
     display_commands.add_parser(
-        "restore-desktop", help="focus the desktop primary monitor under niri"
+        "apply-mode-save",
+        help="write the pinned Gamescope DRM mode into gamescope's modes.cfg",
+    )
+    display_commands.add_parser(
+        "restore-desktop",
+        help="enable the desktop primary under niri and disable the other monitors",
     )
     return parser
 

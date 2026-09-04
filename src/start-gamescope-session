@@ -57,5 +57,11 @@ if [[ $prefer_mode =~ ^([1-9][0-9]*)x([1-9][0-9]*)@([1-9][0-9]*)$ ]]; then
     export CACHYOS_GAMESCOPE_H="${BASH_REMATCH[2]}"
     export CACHYOS_GAMESCOPE_R="${BASH_REMATCH[3]}"
     install_output_mode_wrapper
+    # Gamescope 3.16 calls init_drm(0,0,0); -W -H only size the nested
+    # Steam desktop. The KMS mode for an external display comes from
+    # GAMESCOPE_MODE_SAVE_FILE, which the CachyOS session already exports.
+    if ! "$sessionctl" display apply-mode-save; then
+        printf '%s\n' 'start-gamescope-session: could not write gamescope modes.cfg' >&2
+    fi
 fi
 exec "$start_command" "$@"

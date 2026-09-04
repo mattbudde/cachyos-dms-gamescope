@@ -281,6 +281,47 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertFalse(self.display_conf.exists())
 
+    def test_display_set_gamescope_records_niri_make_and_model(self) -> None:
+        self.make_fake_niri(self.enabled("HDMI-A-1"))
+        result = self.run_sessionctl(
+            "display",
+            "set",
+            "gamescope",
+            "HDMI-A-1",
+            environment=self.niri_environment(),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = self.display_conf.read_text(encoding="utf-8")
+        self.assertIn("gamescope_make = Fixture", saved)
+        self.assertIn("gamescope_model = Model HDMI-A-1", saved)
+
+    def test_apply_mode_save_writes_gamescope_modes_cfg(self) -> None:
+        self.make_fake_niri(self.enabled("HDMI-A-1"))
+        hwdata = self.root / "usr/share/hwdata"
+        hwdata.mkdir(parents=True)
+        (hwdata / "pnp.ids").write_text("TCL\tFixture\n", encoding="utf-8")
+        self.run_sessionctl(
+            "display",
+            "set",
+            "gamescope",
+            "HDMI-A-1",
+            environment=self.niri_environment(),
+        )
+        self.run_sessionctl("display", "set", "mode", "1920x1080@60")
+        result = self.run_sessionctl("display", "apply-mode-save")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (self.config_home / "gamescope/modes.cfg").read_text(encoding="utf-8"),
+            "Fixture Model HDMI-A-1:1920x1080@60\n"
+            "TCL Model HDMI-A-1:1920x1080@60\n"
+            "External screen:1920x1080@60\n",
+        )
+
+    def test_apply_mode_save_is_a_no_op_without_a_pinned_mode(self) -> None:
+        result = self.run_sessionctl("display", "apply-mode-save")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.config_home / "gamescope/modes.cfg").exists())
+
     def test_display_set_rejects_invalid_modes(self) -> None:
         for value in (
             "1920x1080",
@@ -428,7 +469,7 @@ case "$*" in
         cat {replies}/next.json
         [ -e {replies}/after.json ] && mv -f {replies}/after.json {replies}/next.json
         ;;
-    "msg action focus-monitor "*) ;;
+    "msg action focus-monitor "*|"msg output "*) ;;
     *) exit 2 ;;
 esac
 exit 0
@@ -494,7 +535,13 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             self.niri_calls(log),
-            ["msg --json outputs", "msg action focus-monitor eDP-1"],
+            [
+                "msg --json outputs",
+                "msg output eDP-1 on",
+                "msg output DP-2 off",
+                "msg output HDMI-A-1 off",
+                "msg action focus-monitor eDP-1",
+            ],
         )
 
     def test_restore_desktop_falls_back_to_the_first_name_without_a_panel(self) -> None:
@@ -503,7 +550,16 @@ exit 0
             "display", "restore-desktop", environment=self.niri_environment()
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("msg action focus-monitor DP-1", self.niri_calls(log))
+        self.assertEqual(
+            self.niri_calls(log),
+            [
+                "msg --json outputs",
+                "msg output DP-1 on",
+                "msg output DP-2 off",
+                "msg output HDMI-A-1 off",
+                "msg action focus-monitor DP-1",
+            ],
+        )
 
     def test_restore_desktop_prefers_the_saved_primary_when_connected(self) -> None:
         self.run_sessionctl("display", "set", "desktop", "DP-2")
@@ -513,7 +569,16 @@ exit 0
             "display", "restore-desktop", environment=self.niri_environment()
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("msg action focus-monitor DP-2", self.niri_calls(log))
+        self.assertEqual(
+            self.niri_calls(log),
+            [
+                "msg --json outputs",
+                "msg output DP-2 on",
+                "msg output HDMI-A-1 off",
+                "msg output eDP-1 off",
+                "msg action focus-monitor DP-2",
+            ],
+        )
 
     def test_restore_desktop_ignores_a_disconnected_saved_primary(self) -> None:
         self.run_sessionctl("display", "set", "desktop", "DP-9")
@@ -522,9 +587,18 @@ exit 0
             "display", "restore-desktop", environment=self.niri_environment()
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("msg action focus-monitor eDP-1", self.niri_calls(log))
+        self.assertEqual(
+            self.niri_calls(log),
+            [
+                "msg --json outputs",
+                "msg output eDP-1 on",
+                "msg output DP-1 off",
+                "msg output DP-3 off",
+                "msg action focus-monitor eDP-1",
+            ],
+        )
 
-    def test_restore_desktop_waits_while_only_disabled_outputs_are_reported(self) -> None:
+    def test_restore_desktop_turns_on_a_disabled_primary_without_waiting(self) -> None:
         log = self.make_fake_niri(
             self.disabled("DP-1"), later_outputs=self.enabled("DP-1")
         )
@@ -534,7 +608,11 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             self.niri_calls(log),
-            ["msg --json outputs", "msg --json outputs", "msg action focus-monitor DP-1"],
+            [
+                "msg --json outputs",
+                "msg output DP-1 on",
+                "msg action focus-monitor DP-1",
+            ],
         )
 
     def test_restore_desktop_retries_until_niri_reports_outputs(self) -> None:
@@ -545,7 +623,12 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             self.niri_calls(log),
-            ["msg --json outputs", "msg --json outputs", "msg action focus-monitor DP-1"],
+            [
+                "msg --json outputs",
+                "msg --json outputs",
+                "msg output DP-1 on",
+                "msg action focus-monitor DP-1",
+            ],
         )
 
     def test_status_reports_display_lines(self) -> None:
@@ -852,6 +935,10 @@ done
         self.assertEqual(argv_log.read_text(encoding="utf-8"), "-W 1920 -H 1080 -r 60 extra\n")
         wrappers = list(self.runtime_dir.glob("cachyos-gamescope-mode.*/gamescope"))
         self.assertEqual(len(wrappers), 1, wrappers)
+        self.assertEqual(
+            (self.config_home / "gamescope/modes.cfg").read_text(encoding="utf-8"),
+            "External screen:1920x1080@60\n",
+        )
 
     def test_gamescope_launcher_does_not_inject_mode_flags_on_auto(self) -> None:
         result, argv_log = self.run_gamescope_start_with_fake_binary("exec gamescope extra")
