@@ -64,6 +64,42 @@ class ParseNiriOutputsTest(unittest.TestCase):
         monitors = self.sessionctl.parse_niri_outputs({"eDP-1": {"logical": None}})
         self.assertEqual(monitors[0].label, "eDP-1")
 
+    def test_rounds_niri_millihertz_the_way_drm_stores_vrefresh(self) -> None:
+        self.assertEqual(self.sessionctl.niri_refresh_to_drm_hz(59940), 60)
+        self.assertEqual(self.sessionctl.niri_refresh_to_drm_hz(59951), 60)
+        self.assertEqual(self.sessionctl.niri_refresh_to_drm_hz(60000), 60)
+        self.assertEqual(self.sessionctl.niri_refresh_to_drm_hz(30000), 30)
+
+    def test_parses_connector_modes_from_niri(self) -> None:
+        monitors = self.sessionctl.parse_niri_outputs(
+            {
+                "HDMI-A-1": {
+                    "logical": None,
+                    "modes": [
+                        {
+                            "width": 2560,
+                            "height": 1440,
+                            "refresh_rate": 59951,
+                            "is_preferred": False,
+                        },
+                        {
+                            "width": 1920,
+                            "height": 1080,
+                            "refresh_rate": 60000,
+                            "is_preferred": False,
+                        },
+                    ],
+                }
+            }
+        )
+        self.assertEqual(
+            monitors[0].modes,
+            (
+                self.sessionctl.GamescopeMode(2560, 1440, 60),
+                self.sessionctl.GamescopeMode(1920, 1080, 60),
+            ),
+        )
+
     def test_rejects_a_reply_that_is_not_an_object(self) -> None:
         with self.assertRaises(self.sessionctl.SessionError):
             self.sessionctl.parse_niri_outputs([])
@@ -312,15 +348,49 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             (self.config_home / "gamescope/modes.cfg").read_text(encoding="utf-8"),
-            "Fixture Model HDMI-A-1:1920x1080@60\n"
-            "TCL Model HDMI-A-1:1920x1080@60\n"
-            "External screen:1920x1080@60\n",
+            "Fixture Model HDMI-A-1:1920x1080@0\n"
+            "Fixture - Model HDMI-A-1:1920x1080@0\n"
+            "TCL Model HDMI-A-1:1920x1080@0\n"
+            "TCL - Model HDMI-A-1:1920x1080@0\n"
+            "External screen:1920x1080@0\n",
         )
 
     def test_apply_mode_save_is_a_no_op_without_a_pinned_mode(self) -> None:
         result = self.run_sessionctl("display", "apply-mode-save")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.config_home / "gamescope/modes.cfg").exists())
+
+    def test_apply_mode_save_falls_back_when_the_pin_is_missing_from_edid(self) -> None:
+        hdmi = self.output("HDMI-A-1", True)
+        hdmi["modes"] = [
+            {
+                "width": 3840,
+                "height": 2160,
+                "refresh_rate": 60000,
+                "is_preferred": True,
+            },
+            {
+                "width": 1920,
+                "height": 1080,
+                "refresh_rate": 60000,
+                "is_preferred": False,
+            },
+        ]
+        self.make_fake_niri({"HDMI-A-1": hdmi})
+        environment = self.niri_environment()
+        self.run_sessionctl(
+            "display", "set", "gamescope", "HDMI-A-1", environment=environment
+        )
+        self.run_sessionctl(
+            "display", "set", "mode", "2560x1440@60", environment=environment
+        )
+        result = self.run_sessionctl("display", "apply-mode-save", environment=environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("2560x1440@60 is not in the EDID", result.stderr)
+        self.assertIn("gamescope_mode = 1920x1080@60", self.display_conf.read_text())
+        saved = (self.config_home / "gamescope/modes.cfg").read_text(encoding="utf-8")
+        self.assertIn(":1920x1080@0\n", saved)
+        self.assertNotIn("2560x1440", saved)
 
     def test_display_set_rejects_invalid_modes(self) -> None:
         for value in (
@@ -932,12 +1002,12 @@ done
         self.run_sessionctl("display", "set", "mode", "1920x1080@60")
         result, argv_log = self.run_gamescope_start_with_fake_binary("exec gamescope extra")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(argv_log.read_text(encoding="utf-8"), "-W 1920 -H 1080 -r 60 extra\n")
+        self.assertEqual(argv_log.read_text(encoding="utf-8"), "-W 1920 -H 1080 extra\n")
         wrappers = list(self.runtime_dir.glob("cachyos-gamescope-mode.*/gamescope"))
         self.assertEqual(len(wrappers), 1, wrappers)
         self.assertEqual(
             (self.config_home / "gamescope/modes.cfg").read_text(encoding="utf-8"),
-            "External screen:1920x1080@60\n",
+            "External screen:1920x1080@0\n",
         )
 
     def test_gamescope_launcher_does_not_inject_mode_flags_on_auto(self) -> None:

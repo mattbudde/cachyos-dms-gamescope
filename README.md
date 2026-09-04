@@ -240,14 +240,17 @@ If the plugin is loaded but absent from the bar, add it in the DankBar Layout
 settings. After changing plugin files during development, `dms restart` clears
 Quickshell's external-component cache.
 
-If Game Mode comes up black on a TV that works at 1080p on the desktop, pin
-that mode before the next switch:
+If Game Mode comes up black on a TV whose EDID prefers 4K, pin a mode the
+panel actually advertises (1080p60 is the safe HDMI 1.4-rate choice). 1440p
+can disappear from the EDID after a failed 4K60 handshake:
 
 ```bash
 cachyos-sessionctl display set mode 1920x1080@60
 ```
 
-That writes `~/.config/gamescope/modes.cfg`. Gamescope 3.16 ignores `-W -H`
+That writes `~/.config/gamescope/modes.cfg` with refresh `0` so Gamescope
+matches the first WxH mode instead of requiring an exact DRM vrefresh
+(59.94 Hz timings are stored as 60). Gamescope 3.16 ignores `-W -H`
 for KMS and otherwise follows the EDID preferred mode, which can be 4K even
 when niri is already driving the same connector at 1080p.
 

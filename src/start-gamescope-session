@@ -31,7 +31,10 @@ install_output_mode_wrapper() {
     wrapper_dir="$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/cachyos-gamescope-mode.XXXXXX")"
     cat > "$wrapper_dir/gamescope" <<'EOF'
 #!/bin/sh
-exec "$CACHYOS_GAMESCOPE_BIN" -W "$CACHYOS_GAMESCOPE_W" -H "$CACHYOS_GAMESCOPE_H" -r "$CACHYOS_GAMESCOPE_R" "$@"
+# Do not pass -r. Gamescope's DRM find_mode requires an exact vrefresh, so
+# 59.94 Hz 1440p (or a pin whose size is missing from the EDID) falls through
+# to 4K60. Width and height with refresh 0 match the first WxH mode.
+exec "$CACHYOS_GAMESCOPE_BIN" -W "$CACHYOS_GAMESCOPE_W" -H "$CACHYOS_GAMESCOPE_H" "$@"
 EOF
     chmod +x "$wrapper_dir/gamescope"
     export CACHYOS_GAMESCOPE_BIN="$real_gamescope"
@@ -55,7 +58,6 @@ fi
 if [[ $prefer_mode =~ ^([1-9][0-9]*)x([1-9][0-9]*)@([1-9][0-9]*)$ ]]; then
     export CACHYOS_GAMESCOPE_W="${BASH_REMATCH[1]}"
     export CACHYOS_GAMESCOPE_H="${BASH_REMATCH[2]}"
-    export CACHYOS_GAMESCOPE_R="${BASH_REMATCH[3]}"
     install_output_mode_wrapper
     # Gamescope 3.16 calls init_drm(0,0,0); -W -H only size the nested
     # Steam desktop. The KMS mode for an external display comes from

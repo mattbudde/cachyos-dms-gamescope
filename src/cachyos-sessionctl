@@ -87,6 +87,7 @@ class Monitor:
     make: str | None
     model: str | None
     serial: str | None
+    modes: tuple[GamescopeMode, ...] = ()
 
     @property
     def label(self) -> str:
@@ -324,9 +325,10 @@ def gamescope_prefer_output(preferences: DisplayPreferences) -> str | None:
 
 
 def gamescope_prefer_mode(preferences: DisplayPreferences) -> str | None:
-    if preferences.gamescope_mode is None:
+    mode = resolve_gamescope_kms_mode(preferences)
+    if mode is None:
         return None
-    return str(preferences.gamescope_mode)
+    return str(mode)
 
 
 def pnp_id_for_make(make: str) -> str | None:
@@ -350,9 +352,11 @@ def gamescope_sink_descriptions(preferences: DisplayPreferences) -> tuple[str, .
     descriptions: list[str] = []
     if make and model:
         descriptions.append(f"{make} {model}")
+        descriptions.append(f"{make} - {model}")
         pnp_id = pnp_id_for_make(make)
         if pnp_id:
             descriptions.append(f"{pnp_id} {model}")
+            descriptions.append(f"{pnp_id} - {model}")
     elif model:
         descriptions.append(model)
     descriptions.append("External screen")
@@ -370,9 +374,76 @@ def gamescope_mode_save_path() -> Path:
     return Path(base) / GAMESCOPE_MODE_SAVE_RELATIVE
 
 
+def niri_refresh_to_drm_hz(refresh_rate: object) -> int | None:
+    if not isinstance(refresh_rate, int) or refresh_rate <= 0:
+        return None
+    hz = (refresh_rate + 500) // 1000 if refresh_rate >= 1000 else refresh_rate
+    return hz if hz > 0 else None
+
+
+def parse_niri_modes(output: dict[str, object]) -> tuple[GamescopeMode, ...]:
+    raw = output.get("modes")
+    if not isinstance(raw, list):
+        return ()
+    modes: list[GamescopeMode] = []
+    seen: set[tuple[int, int, int]] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        width = item.get("width")
+        height = item.get("height")
+        refresh = niri_refresh_to_drm_hz(item.get("refresh_rate"))
+        if not isinstance(width, int) or not isinstance(height, int) or refresh is None:
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        key = (width, height, refresh)
+        if key in seen:
+            continue
+        seen.add(key)
+        modes.append(GamescopeMode(width, height, refresh))
+    return tuple(modes)
+
+
+def resolve_gamescope_kms_mode(preferences: DisplayPreferences) -> GamescopeMode | None:
+    pinned = preferences.gamescope_mode
+    if pinned is None:
+        return None
+    monitor = find_monitor(
+        niri_monitors_or_none() or (), preferences.gamescope_output
+    )
+    available = monitor.modes if monitor is not None else ()
+    if not available:
+        return pinned
+    same_size = [
+        mode
+        for mode in available
+        if mode.width == pinned.width and mode.height == pinned.height
+    ]
+    if same_size:
+        exact = [mode for mode in same_size if mode.refresh == pinned.refresh]
+        return exact[0] if exact else same_size[0]
+    fallback = [
+        mode for mode in available if mode.width == 1920 and mode.height == 1080
+    ]
+    if not fallback:
+        return pinned
+    sixty = [mode for mode in fallback if mode.refresh == 60]
+    return sixty[0] if sixty else fallback[0]
+
+
 def apply_gamescope_mode_save(preferences: DisplayPreferences) -> int:
-    if preferences.gamescope_mode is None:
+    resolved = resolve_gamescope_kms_mode(preferences)
+    if resolved is None:
         return 0
+    if resolved != preferences.gamescope_mode:
+        print(
+            f"Gamescope mode {preferences.gamescope_mode} is not in the EDID; pinning {resolved}.",
+            file=sys.stderr,
+        )
+        path = display_preferences_path()
+        preferences = replace(preferences, gamescope_mode=resolved)
+        write_display_preferences(path, preferences)
     path = gamescope_mode_save_path()
     descriptions = gamescope_sink_descriptions(preferences)
     prefixes = tuple(f"{description}:" for description in descriptions)
@@ -387,7 +458,13 @@ def apply_gamescope_mode_save(preferences: DisplayPreferences) -> int:
         pass
     except OSError as exc:
         raise SessionError(f"cannot read Gamescope mode save {path}: {exc}") from exc
-    lines = existing + [f"{description}:{preferences.gamescope_mode}" for description in descriptions]
+    # Gamescope find_mode requires an exact DRM vrefresh. 59.94 Hz timings are
+    # stored as 60; a missing size falls through to the EDID preferred 4K mode.
+    # Refresh 0 skips that check and matches the first WxH mode.
+    lines = existing + [
+        f"{description}:{resolved.width}x{resolved.height}@0"
+        for description in descriptions
+    ]
     atomic_write(path, ("\n".join(lines) + "\n").encode("utf-8"))
     return 0
 
@@ -427,6 +504,7 @@ def parse_niri_outputs(reply: object) -> tuple[Monitor, ...]:
             make=optional_text(output.get("make")),
             model=optional_text(output.get("model")),
             serial=optional_text(output.get("serial")),
+            modes=parse_niri_modes(output),
         )
         for name, output in reply.items()
         if isinstance(output, dict)
