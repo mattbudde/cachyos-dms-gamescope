@@ -80,11 +80,13 @@ class IntegrationTest(unittest.TestCase):
         )
         self.runfile = self.root / "run/greetd.run"
         self.config_home = self.root / "home/.config"
+        self.runtime_dir = self.root / "run/user"
         self.display_conf = self.config_home / "cachyos-gamemode/display.conf"
         self.config.parent.mkdir(parents=True)
         self.memory.parent.mkdir(parents=True)
         self.runfile.parent.mkdir(parents=True)
         self.config_home.mkdir(parents=True)
+        self.runtime_dir.mkdir(parents=True)
         self.config.write_text(
             "\n".join(
                 (
@@ -114,6 +116,7 @@ class IntegrationTest(unittest.TestCase):
                 "CACHYOS_GAMEMODE_TESTING": "1",
                 "CACHYOS_GAMEMODE_TEST_ROOT": str(self.root),
                 "XDG_CONFIG_HOME": str(self.config_home),
+                "XDG_RUNTIME_DIR": str(self.runtime_dir),
                 "XDG_CURRENT_DESKTOP": "niri",
             }
         )
@@ -847,11 +850,14 @@ done
         result, argv_log = self.run_gamescope_start_with_fake_binary("exec gamescope extra")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(argv_log.read_text(encoding="utf-8"), "-W 1920 -H 1080 -r 60 extra\n")
+        wrappers = list(self.runtime_dir.glob("cachyos-gamescope-mode.*/gamescope"))
+        self.assertEqual(len(wrappers), 1, wrappers)
 
     def test_gamescope_launcher_does_not_inject_mode_flags_on_auto(self) -> None:
         result, argv_log = self.run_gamescope_start_with_fake_binary("exec gamescope extra")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(argv_log.read_text(encoding="utf-8"), "extra\n")
+        self.assertEqual(list(self.runtime_dir.glob("cachyos-gamescope-mode.*")), [])
 
 
 if __name__ == "__main__":
