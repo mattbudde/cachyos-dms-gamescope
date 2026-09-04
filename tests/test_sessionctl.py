@@ -243,6 +243,56 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
 
+    def test_display_set_mode_persists_and_keeps_connectors(self) -> None:
+        self.run_sessionctl("display", "set", "gamescope", "HDMI-A-1")
+        result = self.run_sessionctl("display", "set", "mode", "1920x1080@60")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.display_conf.read_text(encoding="utf-8"),
+            "[display]\ngamescope_output = HDMI-A-1\ngamescope_mode = 1920x1080@60\n",
+        )
+        result = self.run_sessionctl("display", "prefer-mode")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "1920x1080@60\n")
+
+        result = self.run_sessionctl("display", "set", "gamescope", "DP-1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.display_conf.read_text(encoding="utf-8"),
+            "[display]\ngamescope_output = DP-1\ngamescope_mode = 1920x1080@60\n",
+        )
+
+        result = self.run_sessionctl("display", "set", "mode", "auto")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.display_conf.read_text(encoding="utf-8"),
+            "[display]\ngamescope_output = DP-1\n",
+        )
+        result = self.run_sessionctl("display", "prefer-mode")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_display_prefer_mode_is_empty_without_a_preference(self) -> None:
+        result = self.run_sessionctl("display", "prefer-mode")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(self.display_conf.exists())
+
+    def test_display_set_rejects_invalid_modes(self) -> None:
+        for value in (
+            "1920x1080",
+            "1920x1080@",
+            "0x1080@60",
+            "1920x0@60",
+            "1920x1080@0",
+            "3840x2160@60Hz",
+        ):
+            with self.subTest(value=value):
+                result = self.run_sessionctl("display", "set", "mode", value)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("not a Gamescope mode", result.stderr)
+        self.assertFalse(self.display_conf.exists())
+
     def test_display_prefer_output_is_empty_without_a_preference(self) -> None:
         result = self.run_sessionctl("display", "prefer-output")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -283,6 +333,7 @@ class IntegrationTest(unittest.TestCase):
             {
                 "gamescope_output": "HDMI-A-1",
                 "gamescope_prefer_output": "HDMI-A-1,*",
+                "gamescope_mode": None,
                 "desktop_primary": None,
                 "monitors": [
                     {"connector": "DP-1", "label": "Model DP-1", "enabled": True, "present": True},
@@ -290,6 +341,15 @@ class IntegrationTest(unittest.TestCase):
                 ],
             },
         )
+
+    def test_status_json_reports_a_pinned_gamescope_mode(self) -> None:
+        self.run_sessionctl("display", "set", "gamescope", "HDMI-A-1")
+        self.run_sessionctl("display", "set", "mode", "1920x1080@60")
+        result = self.run_sessionctl("status", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        display = json.loads(result.stdout)["display"]
+        self.assertEqual(display["gamescope_mode"], "1920x1080@60")
+        self.assertEqual(display["gamescope_prefer_output"], "HDMI-A-1,*")
 
     def test_status_json_lists_connected_monitors_including_disabled(self) -> None:
         self.make_fake_niri(self.enabled("HDMI-A-2") | self.disabled("DP-1"))
@@ -752,6 +812,46 @@ done
         result = self.run_gamescope_start(self.UNSET_CHECK)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("using Gamescope defaults", result.stderr)
+
+    def run_gamescope_start_with_fake_binary(
+        self, starter_body: str
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        fake_bin = self.root / "fake-bin"
+        fake_bin.mkdir()
+        argv_log = self.root / "gamescope.argv"
+        gamescope = fake_bin / "gamescope"
+        gamescope.write_text(
+            "#!/usr/bin/env sh\n"
+            f"printf '%s\\n' \"$*\" > '{argv_log}'\n",
+            encoding="utf-8",
+        )
+        gamescope.chmod(0o755)
+        starter = self.root / "start-official"
+        starter.write_text(f"#!/usr/bin/env sh\n{starter_body}\n", encoding="utf-8")
+        starter.chmod(0o755)
+        environment = self.environment | self.STALE_DESKTOP_ENVIRONMENT | {
+            "CACHYOS_GAMEMODE_TEST_START": str(starter),
+            "PATH": f"{fake_bin}:{self.environment.get('PATH', '')}",
+        }
+        result = subprocess.run(
+            [str(GAMESCOPE_START)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        return result, argv_log
+
+    def test_gamescope_launcher_injects_output_mode_flags(self) -> None:
+        self.run_sessionctl("display", "set", "mode", "1920x1080@60")
+        result, argv_log = self.run_gamescope_start_with_fake_binary("exec gamescope extra")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(argv_log.read_text(encoding="utf-8"), "-W 1920 -H 1080 -r 60 extra\n")
+
+    def test_gamescope_launcher_does_not_inject_mode_flags_on_auto(self) -> None:
+        result, argv_log = self.run_gamescope_start_with_fake_binary("exec gamescope extra")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(argv_log.read_text(encoding="utf-8"), "extra\n")
 
 
 if __name__ == "__main__":

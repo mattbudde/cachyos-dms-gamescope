@@ -45,9 +45,11 @@ AUTOLOGIN_SETTINGS = (
 Connector = NewType("Connector", str)
 CheckStatus = Literal["ok", "warn", "fail"]
 CONNECTOR_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9-]*-[0-9]+")
+MODE_PATTERN = re.compile(r"([1-9]\d*)x([1-9]\d*)@([1-9]\d*)")
 INTERNAL_PANEL_PREFIXES = ("eDP-", "LVDS-", "DSI-")
 AUTO = "auto"
 DISPLAY_FIELDS = {"gamescope": "gamescope_output", "desktop": "desktop_primary"}
+DISPLAY_SET_TARGETS = (*DISPLAY_FIELDS, "mode")
 NIRI_OUTPUTS_RETRY_SECONDS = 3.0
 NIRI_OUTPUTS_RETRY_INTERVAL = 0.25
 DOCTOR_COMMAND_TIMEOUT = 5.0
@@ -58,9 +60,20 @@ class SessionError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class GamescopeMode:
+    width: int
+    height: int
+    refresh: int
+
+    def __str__(self) -> str:
+        return f"{self.width}x{self.height}@{self.refresh}"
+
+
+@dataclass(frozen=True)
 class DisplayPreferences:
     gamescope_output: Connector | None = None
     desktop_primary: Connector | None = None
+    gamescope_mode: GamescopeMode | None = None
 
 
 @dataclass(frozen=True)
@@ -237,6 +250,17 @@ def parse_connector_or_auto(text: str) -> Connector | None:
     return None if text == AUTO else parse_connector(text)
 
 
+def parse_gamescope_mode(text: str) -> GamescopeMode:
+    match = MODE_PATTERN.fullmatch(text)
+    if match is None:
+        raise SessionError(f"not a Gamescope mode: {text!r}")
+    return GamescopeMode(int(match[1]), int(match[2]), int(match[3]))
+
+
+def parse_gamescope_mode_or_auto(text: str) -> GamescopeMode | None:
+    return None if text == AUTO else parse_gamescope_mode(text)
+
+
 def display_preferences_path() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
     return Path(base) / DISPLAY_PREFERENCES_RELATIVE
@@ -253,11 +277,13 @@ def read_display_preferences(path: Path) -> DisplayPreferences:
         raise SessionError(f"cannot read display preferences {path}: {exc}") from exc
 
     section = parser["display"] if parser.has_section("display") else {}
-    values = {
+    values: dict[str, object] = {
         field: parse_connector(section[field].strip())
         for field in DISPLAY_FIELDS.values()
         if field in section
     }
+    if "gamescope_mode" in section:
+        values["gamescope_mode"] = parse_gamescope_mode(section["gamescope_mode"].strip())
     return DisplayPreferences(**values)
 
 
@@ -267,6 +293,8 @@ def write_display_preferences(path: Path, preferences: DisplayPreferences) -> No
         value = getattr(preferences, field)
         if value is not None:
             lines.append(f"{field} = {value}")
+    if preferences.gamescope_mode is not None:
+        lines.append(f"gamescope_mode = {preferences.gamescope_mode}")
     atomic_write(path, ("\n".join(lines) + "\n").encode("utf-8"))
 
 
@@ -274,6 +302,12 @@ def gamescope_prefer_output(preferences: DisplayPreferences) -> str | None:
     if preferences.gamescope_output is None:
         return None
     return f"{preferences.gamescope_output},*"
+
+
+def gamescope_prefer_mode(preferences: DisplayPreferences) -> str | None:
+    if preferences.gamescope_mode is None:
+        return None
+    return str(preferences.gamescope_mode)
 
 
 def default_primary(outputs: Sequence[Connector]) -> Connector | None:
@@ -435,11 +469,12 @@ def display_list(preferences: DisplayPreferences) -> int:
 
 
 def display_set(target: str, value: str) -> int:
-    connector = parse_connector_or_auto(value)
     path = display_preferences_path()
-    preferences = replace(
-        read_display_preferences(path), **{DISPLAY_FIELDS[target]: connector}
-    )
+    current = read_display_preferences(path)
+    if target == "mode":
+        preferences = replace(current, gamescope_mode=parse_gamescope_mode_or_auto(value))
+    else:
+        preferences = replace(current, **{DISPLAY_FIELDS[target]: parse_connector_or_auto(value)})
     write_display_preferences(path, preferences)
     print(f"Display preference for {target} set to {value}.")
     return 0
@@ -447,12 +482,17 @@ def display_set(target: str, value: str) -> int:
 
 def display_command(args: argparse.Namespace) -> int:
     if args.display_command == "set":
-        return display_set(args.target, args.connector)
+        return display_set(args.target, args.value)
     preferences = read_display_preferences(display_preferences_path())
     if args.display_command == "prefer-output":
         prefer_output = gamescope_prefer_output(preferences)
         if prefer_output is not None:
             print(prefer_output)
+        return 0
+    if args.display_command == "prefer-mode":
+        prefer_mode = gamescope_prefer_mode(preferences)
+        if prefer_mode is not None:
+            print(prefer_mode)
         return 0
     if args.display_command == "list":
         return display_list(preferences)
@@ -535,6 +575,7 @@ def status(config: Config, compact: bool, as_json: bool) -> int:
 
     preferences = read_display_preferences(display_preferences_path())
     prefer_output = gamescope_prefer_output(preferences)
+    prefer_mode = gamescope_prefer_mode(preferences)
     if as_json:
         monitors = niri_monitors_or_none() if niri_session_active() else None
         report = {
@@ -543,6 +584,7 @@ def status(config: Config, compact: bool, as_json: bool) -> int:
             "display": {
                 "gamescope_output": preferences.gamescope_output,
                 "gamescope_prefer_output": prefer_output,
+                "gamescope_mode": prefer_mode,
                 "desktop_primary": preferences.desktop_primary,
                 "monitors": monitor_report(monitors, preferences),
             },
@@ -558,6 +600,7 @@ def status(config: Config, compact: bool, as_json: bool) -> int:
     print(f"DMS memory:         {path}")
     print(f"Gamescope output:   {preferences.gamescope_output or AUTO}"
           + (f" (OUTPUT_CONNECTOR={prefer_output})" if prefer_output else ""))
+    print(f"Gamescope mode:     {preferences.gamescope_mode or AUTO}")
     print(f"Desktop primary:    {preferences.desktop_primary or AUTO}")
     return 0
 
@@ -1107,15 +1150,18 @@ def build_parser() -> argparse.ArgumentParser:
     display_parser = subparsers.add_parser("display", help="choose monitors per session")
     display_commands = display_parser.add_subparsers(dest="display_command", required=True)
     display_set_parser = display_commands.add_parser(
-        "set", help="pick the Gamescope monitor or the desktop primary"
+        "set", help="pick the Gamescope monitor, output mode, or the desktop primary"
     )
-    display_set_parser.add_argument("target", choices=tuple(DISPLAY_FIELDS))
-    display_set_parser.add_argument("connector", metavar="CONNECTOR|auto")
+    display_set_parser.add_argument("target", choices=DISPLAY_SET_TARGETS)
+    display_set_parser.add_argument("value", metavar="CONNECTOR|MODE|auto")
     display_commands.add_parser(
         "list", help="show connected monitors, on or off on the desktop"
     )
     display_commands.add_parser(
         "prefer-output", help="print the Gamescope OUTPUT_CONNECTOR value, if any"
+    )
+    display_commands.add_parser(
+        "prefer-mode", help="print the Gamescope output mode, if any"
     )
     display_commands.add_parser(
         "restore-desktop", help="focus the desktop primary monitor under niri"
