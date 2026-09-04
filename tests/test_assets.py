@@ -63,6 +63,13 @@ class AssetTest(unittest.TestCase):
             "/usr/local/bin/cachyos-sessionctl display restore-desktop",
         )
 
+    def test_monitor_picker_reads_status_json_not_quickshell_screens(self) -> None:
+        widget = (PROJECT / "dms-plugin/cachyosGameMode/GameModeBar.qml").read_text(
+            encoding="utf-8"
+        )
+        self.assertFalse("Quickshell.screens" in widget, "picker still enumerates Quickshell.screens")
+        self.assertTrue("display.monitors" in widget, "picker does not read report.display.monitors")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

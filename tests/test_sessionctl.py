@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +19,54 @@ PROJECT = Path(__file__).resolve().parents[1]
 SESSIONCTL = PROJECT / "src/cachyos-sessionctl"
 HANDOFF = PROJECT / "src/cachyos-session-handoff"
 GAMESCOPE_START = PROJECT / "src/start-gamescope-session"
+
+
+def load_sessionctl():
+    loader = importlib.machinery.SourceFileLoader("cachyos_sessionctl", str(SESSIONCTL))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    # dataclass field resolution reads sys.modules[cls.__module__] for the deferred annotations
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+class ParseNiriOutputsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.sessionctl = load_sessionctl()
+
+    def test_keeps_disabled_outputs_and_tolerates_odd_fields(self) -> None:
+        reply = {
+            "HDMI-A-2": {
+                "name": "HDMI-A-2",
+                "make": 7,
+                "model": "Fire Stick",
+                "serial": None,
+                "logical": None,
+            },
+            "DP-1": {
+                "name": "DP-1",
+                "make": "Vendor",
+                "model": None,
+                "modes": [],
+                "logical": {"x": 0, "y": 0},
+            },
+            "junk": "not an output",
+        }
+        monitors = self.sessionctl.parse_niri_outputs(reply)
+        self.assertEqual([monitor.connector for monitor in monitors], ["DP-1", "HDMI-A-2"])
+        self.assertEqual([monitor.enabled for monitor in monitors], [True, False])
+        self.assertEqual([monitor.label for monitor in monitors], ["Vendor", "Fire Stick"])
+        self.assertIsNone(monitors[1].make)
+
+    def test_label_falls_back_to_the_connector(self) -> None:
+        monitors = self.sessionctl.parse_niri_outputs({"eDP-1": {"logical": None}})
+        self.assertEqual(monitors[0].label, "eDP-1")
+
+    def test_rejects_a_reply_that_is_not_an_object(self) -> None:
+        with self.assertRaises(self.sessionctl.SessionError):
+            self.sessionctl.parse_niri_outputs([])
 
 
 class IntegrationTest(unittest.TestCase):
@@ -221,7 +272,8 @@ class IntegrationTest(unittest.TestCase):
 
     def test_status_json_reports_display_preferences(self) -> None:
         self.run_sessionctl("display", "set", "gamescope", "HDMI-A-1")
-        result = self.run_sessionctl("status", "--json")
+        self.make_fake_niri(self.enabled("DP-1"))
+        result = self.run_sessionctl("status", "--json", environment=self.niri_environment())
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)
         self.assertEqual(report["active"], "niri")
@@ -232,8 +284,65 @@ class IntegrationTest(unittest.TestCase):
                 "gamescope_output": "HDMI-A-1",
                 "gamescope_prefer_output": "HDMI-A-1,*",
                 "desktop_primary": None,
+                "monitors": [
+                    {"connector": "DP-1", "label": "Model DP-1", "enabled": True, "present": True},
+                    {"connector": "HDMI-A-1", "label": "HDMI-A-1", "enabled": False, "present": False},
+                ],
             },
         )
+
+    def test_status_json_lists_connected_monitors_including_disabled(self) -> None:
+        self.make_fake_niri(self.enabled("HDMI-A-2") | self.disabled("DP-1"))
+        result = self.run_sessionctl("status", "--json", environment=self.niri_environment())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)["display"]["monitors"],
+            [
+                {"connector": "DP-1", "label": "Model DP-1", "enabled": False, "present": True},
+                {"connector": "HDMI-A-2", "label": "Model HDMI-A-2", "enabled": True, "present": True},
+            ],
+        )
+
+    def test_status_json_monitors_is_null_outside_niri(self) -> None:
+        log = self.make_fake_niri(self.enabled("DP-1"))
+        result = self.run_sessionctl(
+            "status", "--json", environment=self.niri_environment("KDE")
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(json.loads(result.stdout)["display"]["monitors"])
+        self.assertEqual(self.niri_calls(log), [])
+
+    def test_status_json_degrades_monitors_when_niri_fails(self) -> None:
+        self.make_failing_niri()
+        result = self.run_sessionctl("status", "--json", environment=self.niri_environment())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertIsNone(json.loads(result.stdout)["display"]["monitors"])
+
+    def test_display_list_marks_off_monitors_and_the_pinned_role(self) -> None:
+        self.run_sessionctl("display", "set", "gamescope", "HDMI-A-2")
+        self.run_sessionctl("display", "set", "desktop", "DP-1")
+        self.make_fake_niri(self.enabled("DP-1") | self.disabled("HDMI-A-2"))
+        result = self.run_sessionctl("display", "list", environment=self.niri_environment())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = {line.split()[0]: line for line in result.stdout.splitlines()[1:]}
+        self.assertRegex(rows["DP-1"], r"\bon\b.*Model DP-1.*\bdesktop\b")
+        self.assertRegex(rows["HDMI-A-2"], r"\boff\b.*Model HDMI-A-2.*\bgamescope\b")
+
+    def test_display_list_fails_loudly_when_niri_fails(self) -> None:
+        self.make_failing_niri()
+        result = self.run_sessionctl("display", "list", environment=self.niri_environment())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("niri", result.stderr)
+
+    def test_display_list_is_a_single_line_outside_niri(self) -> None:
+        log = self.make_fake_niri(self.enabled("DP-1"))
+        result = self.run_sessionctl(
+            "display", "list", environment=self.niri_environment("KDE")
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        self.assertEqual(self.niri_calls(log), [])
 
     def make_fake_niri(
         self,
@@ -266,6 +375,17 @@ exit 0
         (bin_dir / "niri").chmod(0o755)
         return log
 
+    def make_failing_niri(self) -> Path:
+        bin_dir = self.root / "fake-bin"
+        bin_dir.mkdir(exist_ok=True)
+        log = self.root / "niri.log"
+        (bin_dir / "niri").write_text(
+            f"#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {log}\nexit 2\n",
+            encoding="utf-8",
+        )
+        (bin_dir / "niri").chmod(0o755)
+        return log
+
     def niri_environment(self, desktop: str = "niri") -> dict[str, str]:
         return self.environment | {
             "PATH": f"{self.root / 'fake-bin'}:{self.environment['PATH']}",
@@ -278,8 +398,22 @@ exit 0
         return log.read_text(encoding="utf-8").splitlines()
 
     @staticmethod
-    def enabled(*names: str) -> dict[str, object]:
-        return {name: {"name": name, "logical": {"x": 0, "y": 0}} for name in names}
+    def output(name: str, enabled: bool) -> dict[str, object]:
+        return {
+            "name": name,
+            "make": "Fixture",
+            "model": f"Model {name}",
+            "serial": None,
+            "logical": {"x": 0, "y": 0} if enabled else None,
+        }
+
+    @classmethod
+    def enabled(cls, *names: str) -> dict[str, object]:
+        return {name: cls.output(name, True) for name in names}
+
+    @classmethod
+    def disabled(cls, *names: str) -> dict[str, object]:
+        return {name: cls.output(name, False) for name in names}
 
     def test_restore_desktop_is_a_no_op_outside_niri(self) -> None:
         log = self.make_fake_niri(self.enabled("DP-1"))
@@ -320,14 +454,25 @@ exit 0
 
     def test_restore_desktop_ignores_a_disconnected_saved_primary(self) -> None:
         self.run_sessionctl("display", "set", "desktop", "DP-9")
-        outputs = self.enabled("DP-1", "eDP-1")
-        outputs["DP-3"] = {"name": "DP-3", "logical": None}
-        log = self.make_fake_niri(outputs)
+        log = self.make_fake_niri(self.enabled("DP-1", "eDP-1") | self.disabled("DP-3"))
         result = self.run_sessionctl(
             "display", "restore-desktop", environment=self.niri_environment()
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("msg action focus-monitor eDP-1", self.niri_calls(log))
+
+    def test_restore_desktop_waits_while_only_disabled_outputs_are_reported(self) -> None:
+        log = self.make_fake_niri(
+            self.disabled("DP-1"), later_outputs=self.enabled("DP-1")
+        )
+        result = self.run_sessionctl(
+            "display", "restore-desktop", environment=self.niri_environment()
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.niri_calls(log),
+            ["msg --json outputs", "msg --json outputs", "msg action focus-monitor DP-1"],
+        )
 
     def test_restore_desktop_retries_until_niri_reports_outputs(self) -> None:
         log = self.make_fake_niri({}, later_outputs=self.enabled("DP-1"))
@@ -514,6 +659,22 @@ exit 0
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.doctor_by_id(result)["gamescope-output"]["status"], "warn")
+
+    def test_doctor_accepts_a_pinned_monitor_that_is_off_on_the_desktop(self) -> None:
+        self.plant_install()
+        self.run_sessionctl("display", "set", "gamescope", "HDMI-A-2")
+        log = self.make_fake_niri(self.enabled("eDP-1") | self.disabled("HDMI-A-2"))
+        result = self.run_doctor(
+            "--json",
+            environment=self.doctor_environment(
+                self.root / "fake-bin", self.root / "usr/local/bin"
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        check = self.doctor_by_id(result)["gamescope-output"]
+        self.assertEqual(check["status"], "ok", check)
+        self.assertIn("off on the desktop", check["summary"])
+        self.assertEqual(self.niri_calls(log), ["msg --json outputs"])
 
     def test_doctor_ignores_missing_autostart_outside_niri(self) -> None:
         self.plant_install()
