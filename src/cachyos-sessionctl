@@ -534,7 +534,7 @@ def status(config: Config, compact: bool, as_json: bool) -> int:
             try:
                 monitors = niri_monitors()
             except SessionError:
-                pass  # the popout must still render preferences when niri IPC hiccups
+                pass
         report = {
             "active": active,
             "remembered": selected,
