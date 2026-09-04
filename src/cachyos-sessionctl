@@ -345,6 +345,40 @@ def find_monitor(monitors: Sequence[Monitor], connector: Connector | None) -> Mo
     return next((monitor for monitor in monitors if monitor.connector == connector), None)
 
 
+def monitor_report(
+    monitors: Sequence[Monitor] | None, preferences: DisplayPreferences
+) -> list[dict[str, object]] | None:
+    if monitors is None:
+        return None
+    rows: list[dict[str, object]] = [
+        {
+            "connector": monitor.connector,
+            "label": monitor.label,
+            "enabled": monitor.enabled,
+            "present": True,
+        }
+        for monitor in monitors
+    ]
+    pinned = preferences.gamescope_output
+    if pinned is not None and find_monitor(monitors, pinned) is None:
+        rows.append({"connector": pinned, "label": pinned, "enabled": False, "present": False})
+    return rows
+
+
+def monitor_roles(connector: object, preferences: DisplayPreferences) -> str:
+    return ", ".join(
+        target
+        for target, field in DISPLAY_FIELDS.items()
+        if getattr(preferences, field) == connector
+    )
+
+
+def desktop_state(row: dict[str, object]) -> str:
+    if row["enabled"]:
+        return "on"
+    return "off" if row["present"] else "unplugged"
+
+
 def niri_focus_monitor(connector: Connector) -> None:
     try:
         result = subprocess.run(
@@ -373,6 +407,26 @@ def restore_desktop_display(preferences: DisplayPreferences) -> int:
     return 0
 
 
+def display_list(preferences: DisplayPreferences) -> int:
+    if not niri_session_active():
+        print("Not a niri session; monitors can only be listed from the niri desktop.")
+        return 0
+    rows = monitor_report(niri_monitors(), preferences) or []
+    lines = [("CONNECTOR", "DESKTOP", "MONITOR", "ROLE")] + [
+        (
+            str(row["connector"]),
+            desktop_state(row),
+            str(row["label"]),
+            monitor_roles(row["connector"], preferences),
+        )
+        for row in rows
+    ]
+    widths = [max(len(line[column]) for line in lines) for column in range(len(lines[0]))]
+    for line in lines:
+        print("  ".join(cell.ljust(width) for cell, width in zip(line, widths)).rstrip())
+    return 0
+
+
 def display_set(target: str, value: str) -> int:
     connector = parse_connector_or_auto(value)
     path = display_preferences_path()
@@ -393,6 +447,8 @@ def display_command(args: argparse.Namespace) -> int:
         if prefer_output is not None:
             print(prefer_output)
         return 0
+    if args.display_command == "list":
+        return display_list(preferences)
     return restore_desktop_display(preferences)
 
 
@@ -473,6 +529,12 @@ def status(config: Config, compact: bool, as_json: bool) -> int:
     preferences = read_display_preferences(display_preferences_path())
     prefer_output = gamescope_prefer_output(preferences)
     if as_json:
+        monitors = None
+        if niri_session_active():
+            try:
+                monitors = niri_monitors()
+            except SessionError:
+                pass  # the popout must still render preferences when niri IPC hiccups
         report = {
             "active": active,
             "remembered": selected,
@@ -480,6 +542,7 @@ def status(config: Config, compact: bool, as_json: bool) -> int:
                 "gamescope_output": preferences.gamescope_output,
                 "gamescope_prefer_output": prefer_output,
                 "desktop_primary": preferences.desktop_primary,
+                "monitors": monitor_report(monitors, preferences),
             },
         }
         print(json.dumps(report, indent=2, sort_keys=True))
@@ -1046,6 +1109,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     display_set_parser.add_argument("target", choices=tuple(DISPLAY_FIELDS))
     display_set_parser.add_argument("connector", metavar="CONNECTOR|auto")
+    display_commands.add_parser(
+        "list", help="show connected monitors, on or off on the desktop"
+    )
     display_commands.add_parser(
         "prefer-output", help="print the Gamescope OUTPUT_CONNECTOR value, if any"
     )
