@@ -337,6 +337,13 @@ def niri_monitors() -> tuple[Monitor, ...]:
     return parse_niri_outputs(reply)
 
 
+def niri_monitors_or_none() -> tuple[Monitor, ...] | None:
+    try:
+        return niri_monitors()
+    except SessionError:
+        return None
+
+
 def enabled_connectors(monitors: Sequence[Monitor]) -> tuple[Connector, ...]:
     return tuple(monitor.connector for monitor in monitors if monitor.enabled)
 
@@ -529,12 +536,7 @@ def status(config: Config, compact: bool, as_json: bool) -> int:
     preferences = read_display_preferences(display_preferences_path())
     prefer_output = gamescope_prefer_output(preferences)
     if as_json:
-        monitors = None
-        if niri_session_active():
-            try:
-                monitors = niri_monitors()
-            except SessionError:
-                pass
+        monitors = niri_monitors_or_none() if niri_session_active() else None
         report = {
             "active": active,
             "remembered": selected,
